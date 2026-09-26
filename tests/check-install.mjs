@@ -205,7 +205,7 @@ const cases = {
   // on a migrated machine find and reuse the Worker it was meant to leave.
   namesAreSasonicaShell() {
     const src = readFileSync(path.join(ROOT, 'install.mjs'), 'utf8');
-    assert.match(src, /`sasonica-shell-\$\{site\}`;\nconst dbName/, 'the default Worker name');
+    assert.match(src, /`sasonica-shell-\$\{site\}`;\r?\nconst dbName/, 'the default Worker name');
     assert.match(src, /SASONICA_DB_NAME \|\| `sasonica-shell-\$\{site\}`/, 'the default database name');
     assert.equal(UNIT, 'sasonica-shell.service');
     assert.ok(existsSync(path.join(ROOT, UNIT)), `the unit template ${UNIT} is not in the repo`);
