@@ -288,6 +288,32 @@ const cases = {
     assert.match(html, /&#60;script&#62;/);
   },
 
+  async grantsListedAndRevokedByLabel() {
+    reset();
+    const f = fakeD1([]);
+    const env = envFor(f.binding, { SASONICA_RUNNER_TOKEN: 'runner-token' });
+    const runner = async (body) => (await worker.fetch(new Request(ORIGIN + '/runner', {
+      method: 'POST', headers: { authorization: 'Bearer runner-token', 'content-type': 'application/json' }, body: JSON.stringify(body),
+    }), env, ctx)).json();
+    const tokens = {};
+    for (const name of ['Claude', 'ChatGPT']) {
+      const id = await register_(env, name);
+      const { to } = await signIn(env, id);
+      tokens[name] = (await token(env, id, to.searchParams.get('code'))).body.access_token;
+    }
+    const { grants } = await runner({ op: 'grants' });
+    assert.deepEqual(grants.map((g) => g.label).sort(), ['oauth-chatgpt', 'oauth-claude']);
+    assert.equal((await runner({ op: 'grant-revoke', label: 'oauth-claude' })).revoked, 1);
+    assert.equal((await rpc(env, tokens.Claude, 'ping')).status, 401, 'the revoked assistant is out');
+    assert.equal((await rpc(env, tokens.ChatGPT, 'ping')).status, 200, 'the other still works');
+    // Off: the ops say so rather than failing.
+    const off = envFor(f.binding, { OAUTH_KV: undefined, SASONICA_RUNNER_TOKEN: 'runner-token' });
+    const r = await (await worker.fetch(new Request(ORIGIN + '/runner', {
+      method: 'POST', headers: { authorization: 'Bearer runner-token' }, body: JSON.stringify({ op: 'grants' }),
+    }), off, ctx)).json();
+    assert.equal(r.grants, null);
+  },
+
   async grantLabels() {
     const { grantLabel } = await import('../worker/src/oauth.ts');
     assert.equal(grantLabel('ChatGPT', 'abcdef123'), 'oauth-chatgpt');

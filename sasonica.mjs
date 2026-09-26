@@ -523,8 +523,25 @@ if (sub === 'tools') {
 // purpose -- it does not use the runner's credential at all, but the
 // Cloudflare token the installer used (lib/clients.mjs says why).
 if (sub === 'client') {
+  // OAuth grants go through the Worker with the runner's token (revoking
+  // only takes access away); everything else here uses the Cloudflare token.
+  const runner = async (op, body = {}) => {
+    const base = String(cfg.SASONICA_WORKER_URL || '').replace(/\/+$/, '');
+    const u = base ? new URL(base) : null;
+    if (!u || !cfg.SASONICA_RUNNER_TOKEN) throw new Error('SASONICA_WORKER_URL or SASONICA_RUNNER_TOKEN is missing; re-run the installer');
+    if (u.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(u.hostname)) throw new Error('SASONICA_WORKER_URL must be https');
+    const r = await fetch(`${base}/runner`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cfg.SASONICA_RUNNER_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ op, ...body }), signal: AbortSignal.timeout(60_000),
+    });
+    if (r.status === 404) throw new Error('the Worker refused this runner (check SASONICA_RUNNER_TOKEN)');
+    const out = await r.json().catch(() => null);
+    if (!r.ok || out?.error) throw new Error(`worker: ${out?.error ?? r.status}`);
+    return out;
+  };
   process.exit(await clientCommand(rest, {
-    cfg, conf: CONF, wordsFile: path.join(path.dirname(SELF), 'words.txt'),
+    cfg, conf: CONF, wordsFile: path.join(path.dirname(SELF), 'words.txt'), runner,
   }));
 }
 

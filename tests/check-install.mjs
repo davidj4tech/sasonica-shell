@@ -11,7 +11,7 @@ import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { siteName, urlSecret, readEnvFile, renderEnv, renderShim,
+import { siteName, urlSecret, readEnvFile, renderEnv, renderShim, OAUTH_KV_MARKER, oauthKvLine, ownerPolicyBody, accessAppBody,
          winShellCommand, needsWindowsShell } from '../lib/install-lib.mjs';
 import { plist } from '../lib/service-macos.mjs';
 import { taskCommand } from '../lib/service-windows.mjs';
@@ -179,6 +179,24 @@ const cases = {
   invocationLogsStayOff() {
     const tpl = readFileSync(path.join(ROOT, 'worker', 'wrangler.jsonc.template'), 'utf8');
     assert.match(tpl, /"invocation_logs":\s*false/, 'invocation logs would record the secret URL');
+  },
+
+  // OAuth (docs/tools-and-approvals.md §6): what the installer asks Cloudflare
+  // for, and the KV line it puts in place of the template's marker.
+  oauthShapes() {
+    const tpl = readFileSync(path.join(ROOT, 'worker', 'wrangler.jsonc.template'), 'utf8');
+    assert.ok(tpl.includes(OAUTH_KV_MARKER), 'the template has the marker the installer replaces');
+    assert.match(tpl, /"global_fetch_strictly_public"/);
+    const withKv = tpl.replace(OAUTH_KV_MARKER, oauthKvLine('0123456789abcdef0123456789abcdef'));
+    assert.match(withKv, /"kv_namespaces": \[\{ "binding": "OAUTH_KV", "id": "0123456789abcdef0123456789abcdef" \}\],/);
+    assert.deepEqual(ownerPolicyBody('p', 'me@x.com'), { name: 'p', decision: 'allow', include: [{ email: { email: 'me@x.com' } }] });
+    const app = accessAppBody({ name: 'sasonica-shell-red5', callback: 'https://w.example/callback', policyId: 'pol' });
+    assert.equal(app.type, 'saas');
+    assert.equal(app.saas_app.auth_type, 'oidc');
+    assert.deepEqual(app.saas_app.redirect_uris, ['https://w.example/callback']);
+    assert.deepEqual(app.policies, ['pol']);
+    assert.ok(renderEnv({ ownerEmail: 'me@x.com' }).includes('SASONICA_OWNER_EMAIL=me@x.com'));
+    assert.ok(!renderEnv({}).includes('SASONICA_OWNER_EMAIL'), 'off unless given');
   },
 
   // Runlet became Sasonica Shell on 21 Sep 2026, and every name a machine

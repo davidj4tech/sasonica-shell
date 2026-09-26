@@ -286,10 +286,14 @@ and with it on the secret URLs keep working beside it.
 Access that signs real tokens, and the refusals (another email, an
 unverified one, a forged signature, the wrong audience, Deny, a callback or
 consent post from another browser, markup in a client name).
-**Not built yet:** the installer creating the KV namespace, the Access
-app and its owner-only policy (the token needs Workers KV Storage: Edit and
-Access: Apps and Policies: Edit, and the account a Zero Trust organization
-with one-time PIN), and `sasonica client` listing and revoking grants.
+The installer turns it on when given `SASONICA_OWNER_EMAIL`: a KV
+namespace, an owner-only Access policy and an Access for SaaS app, and the
+secrets (SETUP.md, "Sign in instead of a secret URL"). `sasonica client
+grants` lists the signed-in assistants and `revoke oauth-<name>` signs one
+out, through the runner API: revoking only takes access away, so unlike
+minting a URL it needs no Cloudflare token. **Not yet run against a real
+account**: the Access API shapes are from Cloudflare's docs and pinned in
+check-install, not tried.
 
 **The problem.** The connector URL is the only credential, and it opens a
 shell as the owner. URLs travel further than passwords do:

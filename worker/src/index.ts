@@ -585,6 +585,23 @@ function runnerJson(body: unknown, status = 200): Response {
   })
 }
 
+/** The owner's OAuth grants, or null when OAuth is off (no provider helpers in env). */
+async function ownerGrants(env: Env): Promise<{ id: string; userId: string; label: string; clientName: string; createdAt: number }[] | null> {
+  const helpers = (env as any).OAUTH_PROVIDER
+  if (!helpers || !env.SASONICA_OWNER_EMAIL) return null
+  const owner = env.SASONICA_OWNER_EMAIL.trim().toLowerCase()
+  const out = []
+  let cursor: string | undefined
+  do {
+    const page = await helpers.listUserGrants(owner, { limit: 1000, cursor })
+    for (const g of page.items) {
+      out.push({ id: g.id, userId: g.userId, label: String(g.metadata?.label ?? ''), clientName: String(g.metadata?.clientName ?? ''), createdAt: g.createdAt })
+    }
+    cursor = page.cursor
+  } while (cursor)
+  return out
+}
+
 export async function runnerApi(request: Request, env: Env): Promise<Response> {
   const offered = (request.headers.get('authorization') ?? '').replace(/^Bearer /, '')
   // Same 404 as an unknown path: whether the API exists must not depend on
@@ -600,6 +617,20 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
   const id = Number(body?.id)
 
   switch (body?.op) {
+    // OAuth grants (§6): list them, or revoke one assistant's. With the
+    // runner's token, because revoking only ever takes access away -- it
+    // cannot make a grant, as it cannot make a client URL. `null` when
+    // OAuth is off.
+    case 'grants':
+      return runnerJson({ grants: await ownerGrants(env) })
+    case 'grant-revoke': {
+      const grants = await ownerGrants(env)
+      if (!grants) return runnerJson({ error: 'OAuth is off on this Worker' }, 409)
+      const label = String(body?.label ?? '')
+      const hit = grants.filter((g) => g.id === body?.grant || (label && g.label === label))
+      for (const g of hit) await (env as any).OAUTH_PROVIDER.revokeGrant(g.id, g.userId)
+      return runnerJson({ revoked: hit.length })
+    }
     // Claim pending rows and return them ALREADY claimed. The runner used to
     // SELECT and then UPDATE, and two runners could race for the same row;
     // doing both in one statement makes the claim atomic by construction.

@@ -796,6 +796,46 @@ const clientCases = {
   // Refused before anything is sent: a bad label, 'default' as a new client,
   // and no installer token -- the runner's own token, which IS in the env
   // file, must not stand in for it.
+  // OAuth grants go to the Worker with the runner's token, and need no
+  // Cloudflare token: a fake runner API on loopback stands in for it.
+  async clientGrants() {
+    const seen = [];
+    let list = [{ id: 'g1', userId: 'o@x', label: 'oauth-claude', clientName: 'Claude', createdAt: 1790000000 }];
+    const server = createServer((req, res) => {
+      let b = '';
+      req.on('data', (d) => { b += d; });
+      req.on('end', () => {
+        const body = JSON.parse(b || '{}');
+        seen.push({ auth: req.headers.authorization, ...body });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        if (body.op === 'grants') return res.end(JSON.stringify({ grants: list }));
+        const hit = list.filter((g) => g.label === body.label);
+        list = list.filter((g) => g.label !== body.label);
+        res.end(JSON.stringify({ revoked: hit.length }));
+      });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const conf = clientConf({ SASONICA_WORKER_URL: `http://127.0.0.1:${server.address().port}` });
+      const env = cliEnv(conf, 'http://127.0.0.1:1/client/v4');
+      const g = await runCli(['grants'], env);
+      assert.equal(g.code, 0, g.err);
+      assert.match(g.out, /oauth-claude\s+2026-\d\d-\d\d \d\d:\d\d\s+Claude/);
+      const r = await runCli(['revoke', 'oauth-claude'], env);
+      assert.equal(r.code, 0, r.err);
+      assert.match(r.out, /Signed 'oauth-claude' out/);
+      assert.equal(seen.at(-1).op, 'grant-revoke');
+      assert.equal(seen.at(-1).auth, `Bearer ${RUNNER_TOKEN}`);
+      const again = await runCli(['revoke', 'oauth-claude'], env);
+      assert.equal(again.code, 1);
+      assert.match(again.err, /no OAuth grant 'oauth-claude'/);
+      const add = await runCli(['add', 'oauth-mine'], env);
+      assert.equal(add.code, 2, 'oauth- labels are the grants\' own');
+    } finally {
+      server.close();
+    }
+  },
+
   async clientRefusals() {
     const db = fakeD1([]);
     const { api, seen } = await serveCloudflare(db);

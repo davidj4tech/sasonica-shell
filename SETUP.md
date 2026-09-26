@@ -258,6 +258,34 @@ prints a new connector URL, once; paste it into that assistant. `sasonica client
 
 These commands need the Cloudflare token you gave the installer (D1: Edit), since they write the database directly: set `CLOUDFLARE_API_TOKEN`, or keep it in `~/.config/sasonica/install-token` (mode 600). The runner's token is not enough, on purpose.
 
+## Sign in instead of a secret URL (OAuth)
+
+Optional, and off unless you ask for it. The connector URL is then a plain
+address, `https://<worker>/mcp`, and each assistant signs in once: a page on
+the Worker asks you to allow it, then Cloudflare Access emails you a code.
+Only your email gets through. The secret URL keeps working beside it until
+you stop it.
+
+1. **Zero Trust, once per account** (free): https://one.dash.cloudflare.com →
+   pick a team name; then Settings → Authentication → add **One-time PIN**.
+2. **Three more token permissions** (section 2), all Account:
+   Workers KV Storage: Edit; Access: Apps and Policies: Edit; Access:
+   Organizations, Identity Providers, and Groups: Read.
+3. **Re-run the installer with your email**:
+   `SASONICA_OWNER_EMAIL=you@example.com sasonica install` (or put it in
+   `install.conf`). It creates a KV namespace (`<worker>-oauth`), an Access
+   policy that lets only that email through, and an Access for SaaS app for
+   the Worker, and sets the Worker's secrets. It is kept in the env file, so
+   later re-runs keep OAuth on.
+4. **Add the connector** with the plain URL the installer prints, choosing
+   OAuth (or no authentication; the assistant finds the sign-in itself).
+5. Once every assistant has signed in: `sasonica client revoke default`
+   stops the secret URL.
+
+`sasonica client grants` lists the signed-in assistants, one label each
+(`oauth-claude`); `sasonica client revoke oauth-claude` signs one out. Rows
+an assistant queues carry its label, so `sasonica status` shows who asked.
+
 ## Rotate a machine's runner token
 
 `SASONICA_RUNNER_TOKEN` is what a machine presents to its own Worker. Replacing it touches neither the database nor the connector URL:

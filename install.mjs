@@ -26,7 +26,8 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { cfRequest } from './lib/cloudflare.mjs';
 import { hex, siteName, urlSecret, readEnvFile, renderEnv, renderShim, connectorUrl,
-         winShellCommand, needsWindowsShell } from './lib/install-lib.mjs';
+         winShellCommand, needsWindowsShell, OAUTH_KV_MARKER, oauthKvLine, ownerPolicyBody,
+         accessAppBody } from './lib/install-lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WIN = process.platform === 'win32';
@@ -142,6 +143,14 @@ const site = siteName(process.env.SASONICA_SITE || hostname().split('.')[0]);
 // A re-run must find the stack it made, even if the machine was renamed.
 const workerName = process.env.SASONICA_WORKER_NAME || existing.SASONICA_WORKER_NAME || `sasonica-shell-${site}`;
 const dbName = process.env.SASONICA_DB_NAME || existing.SASONICA_DB_NAME || `sasonica-shell-${site}`;
+// OAuth on /mcp (docs/tools-and-approvals.md §6), when the owner's email is
+// given: the connector then signs in with Cloudflare Access instead of
+// carrying a secret. Kept in the env file, so a re-run keeps it on.
+const ownerEmail = (process.env.SASONICA_OWNER_EMAIL || existing.SASONICA_OWNER_EMAIL || '').trim().toLowerCase();
+if (ownerEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(ownerEmail)) {
+  console.error(`SASONICA_OWNER_EMAIL is not an email: ${ownerEmail}`);
+  process.exit(1);
+}
 
 // --- 1. dependencies -----------------------------------------------------------
 say('Checking dependencies');
@@ -163,7 +172,11 @@ if (!token) {
       3. Name it sasonica and add three permissions, all "Account":
             Workers Scripts   Edit
             D1                Edit
-            Account Settings  Read
+            Account Settings  Read${ownerEmail ? `
+         and, for OAuth sign-in (SASONICA_OWNER_EMAIL is set), two more:
+            Workers KV Storage            Edit
+            Access: Apps and Policies     Edit
+            Access: Organizations, Identity Providers, and Groups   Read` : ''}
       4. Continue to summary -> Create Token -> copy it (shown once).`);
   token = await ask('    Paste the token here and press Enter: ', { hidden: true });
 }
@@ -204,12 +217,30 @@ else {
 }
 if (!/^[0-9a-f-]{36}$/.test(dbId ?? '')) die('could not get a database id');
 
+// --- 3b. OAuth's KV namespace (only with SASONICA_OWNER_EMAIL) -------------------
+// The provider's clients, grants and tokens. It encrypts what a grant carries,
+// so the namespace alone cannot mint access.
+let kvId = '';
+if (ownerEmail) {
+  const title = `${workerName}-oauth`;
+  say(`OAuth: KV namespace '${title}'`);
+  const spaces = await cf(`/accounts/${accountId}/storage/kv/namespaces?per_page=100`, { token });
+  kvId = spaces.find((n) => n.title === title)?.id;
+  if (kvId) note(`exists: ${kvId}`);
+  else {
+    kvId = (await cf(`/accounts/${accountId}/storage/kv/namespaces`, { method: 'POST', body: { title }, token })).id;
+    note(`created ${kvId}`);
+  }
+  if (!/^[0-9a-f]{32}$/.test(kvId ?? '')) die('could not get a KV namespace id');
+}
+
 // --- 4. wrangler config -----------------------------------------------------------
 say('Writing worker/wrangler.jsonc');
 writeText(path.join(HERE, 'worker', 'wrangler.jsonc'),
   readFileSync(path.join(HERE, 'worker', 'wrangler.jsonc.template'), 'utf8')
     .replace('__WORKER_NAME__', workerName).replace('__ACCOUNT_ID__', accountId)
-    .replace('__DB_NAME__', dbName).replace('__DB_ID__', dbId));
+    .replace('__DB_NAME__', dbName).replace('__DB_ID__', dbId)
+    .replace(OAUTH_KV_MARKER, kvId ? oauthKvLine(kvId) : OAUTH_KV_MARKER));
 if (wrangler(['d1', 'execute', dbName, '--remote', '--file', path.join(HERE, 'schema.sql')], { capture: true }).code !== 0) {
   die('applying schema.sql failed');
 }
@@ -278,10 +309,55 @@ if (!sub) {
   await cf(`/accounts/${accountId}/workers/subdomain`, { method: 'PUT', body: { subdomain: sub }, token });
   note(`registered workers.dev subdomain: ${sub}`);
 }
+const workerUrl = `https://${workerName}.${sub}.workers.dev`;
+
+// --- 6b. OAuth: the Access app that signs the owner in (only with SASONICA_OWNER_EMAIL)
+if (ownerEmail) {
+  say('OAuth: Cloudflare Access sign-in');
+  let org = null;
+  try { org = await cfRequest(`/accounts/${accountId}/access/organizations`, { token }); } catch { org = null; }
+  if (!org?.auth_domain) {
+    die(`this account has no Zero Trust organization (or the token cannot read it).
+    Turn it on once, free: https://one.dash.cloudflare.com -> pick a team name;
+    then Settings -> Authentication -> add "One-time PIN". Re-run this after.`);
+  }
+  note(`team domain ${org.auth_domain}`);
+  const policyName = `${workerName} owner`;
+  const policies = await cf(`/accounts/${accountId}/access/policies?per_page=100`, { token });
+  let policy = policies.find((p) => p.name === policyName);
+  if (policy) {
+    policy = await cf(`/accounts/${accountId}/access/policies/${policy.id}`, { method: 'PUT', body: ownerPolicyBody(policyName, ownerEmail), token });
+    note(`policy '${policyName}': only ${ownerEmail}`);
+  } else {
+    policy = await cf(`/accounts/${accountId}/access/policies`, { method: 'POST', body: ownerPolicyBody(policyName, ownerEmail), token });
+    note(`created policy '${policyName}': only ${ownerEmail}`);
+  }
+  const apps = await cf(`/accounts/${accountId}/access/apps`, { token });
+  let app = apps.find((a) => a.type === 'saas' && a.name === workerName);
+  const body = accessAppBody({ name: workerName, callback: `${workerUrl}/callback`, policyId: policy.id });
+  const oauthSecrets = [['ACCESS_TEAM_DOMAIN', org.auth_domain], ['SASONICA_OWNER_EMAIL', ownerEmail]];
+  if (app) {
+    // Updated in place: the client secret is shown only when an app is made,
+    // and the Worker already holds it.
+    app = await cf(`/accounts/${accountId}/access/apps/${app.id}`, { method: 'PUT', body, token });
+    note(`Access app '${workerName}' updated (its client secret is unchanged)`);
+  } else {
+    app = await cf(`/accounts/${accountId}/access/apps`, { method: 'POST', body, token });
+    if (!app?.saas_app?.client_secret) die('Access did not return a client secret for the new app');
+    oauthSecrets.push(['ACCESS_CLIENT_SECRET', app.saas_app.client_secret]);
+    note(`created Access app '${workerName}'`);
+  }
+  if (!app?.saas_app?.client_id) die('Access did not return a client id');
+  oauthSecrets.push(['ACCESS_CLIENT_ID', app.saas_app.client_id]);
+  for (const [name, value] of oauthSecrets) {
+    if (wrangler(['secret', 'put', name], { stdin: value, capture: true }).code !== 0) die(`setting ${name} failed`);
+  }
+  note('OAuth secrets set');
+}
+
 const deploy = wrangler(['deploy'], { capture: true });
 if (deploy.code !== 0) { console.error(deploy.err || deploy.out); die('wrangler deploy failed'); }
 for (const line of `${deploy.out}${deploy.err}`.trim().split('\n').slice(-3)) note(line.trim());
-const workerUrl = `https://${workerName}.${sub}.workers.dev`;
 
 // --- 7. local config ------------------------------------------------------------------
 say(`Writing ${ENV_FILE}`);
@@ -289,7 +365,7 @@ say(`Writing ${ENV_FILE}`);
 // through the Worker, and a D1 API token is account-wide: one left on every
 // machine would reach every other machine's queue.
 writeText(ENV_FILE, renderEnv({
-  accountId, site, workerName, dbName, dbId, secret, workerUrl, runnerToken, keyFile: KEY_FILE,
+  accountId, site, workerName, dbName, dbId, secret, workerUrl, runnerToken, keyFile: KEY_FILE, ownerEmail,
 }), 0o600);
 mkdirSync(path.join(CONF, 'skills'), { recursive: true });
 
@@ -365,7 +441,16 @@ console.log(`
 note(`Open ${connectors} in a browser (sign in if it asks).`);
 console.log(`    There: Add custom connector -> paste the URL -> no authentication -> save.
     Then ask Claude to run a command, e.g. "run hostname on my machine".
+${ownerEmail ? `
+    Or sign in instead of a secret (OAuth; only ${ownerEmail} gets through):
 
+        ${workerUrl}/mcp
+
+    Add it as a custom connector with no secret in it; the assistant opens a
+    page to allow it, then Cloudflare emails you a code. Once every assistant
+    signs in, stop the secret URL: sasonica client revoke default
+    Signed-in assistants: sasonica client grants
+` : ''}
     Status:      sasonica status        (sasonica --help for the rest)
     Skills:      link SKILL.md files into ${path.join(CONF, 'skills')} for assistants to find
     Config:      ${ENV_FILE}   (runner token, URL secret)   ${KEY_FILE}
