@@ -6,6 +6,9 @@
   "main": "src/index.ts",
   "account_id": "__ACCOUNT_ID__",
   "compatibility_date": "2026-07-01",
+  // OAuth (src/oauth.ts) fetches Client ID Metadata Documents from URLs a
+  // client names: this keeps those fetches off private addresses.
+  "compatibility_flags": ["global_fetch_strictly_public"],
   // Invocation logs are off because they record each request's URL, and the
   // MCP path IS the credential: with them on, every connector secret sat in
   // Workers Logs for seven days. The Worker's own console lines stay on, and

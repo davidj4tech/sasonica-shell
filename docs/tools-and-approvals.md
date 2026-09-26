@@ -271,6 +271,26 @@ but it is the one that makes interactive use (§4) feel immediate.
 
 ## 6. Sign-in instead of a secret URL
 
+**Status, 27 Sep 2026: the Worker half is built, off until configured.**
+`worker/src/oauth.ts` wraps the MCP endpoint in `workers-oauth-provider`
+with Cloudflare Access (an Access for SaaS OIDC app) as the sign-in: the
+consent page names the assistant and where its access goes, Allow hands off
+to Access, and the callback checks the ID token (RS256 against the app's
+JWKS, issuer, audience, expiry) and that its email is
+`SASONICA_OWNER_EMAIL` before granting. Rows an OAuth connector queues are
+labelled `oauth-<its name>`. It switches on only when `OAUTH_KV`,
+`ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET`, `ACCESS_TEAM_DOMAIN` and
+`SASONICA_OWNER_EMAIL` are all set; until then the Worker is unchanged,
+and with it on the secret URLs keep working beside it.
+`tests/check-oauth.mjs` runs the whole flow in Node against a stand-in
+Access that signs real tokens, and the refusals (another email, an
+unverified one, a forged signature, the wrong audience, Deny, a callback or
+consent post from another browser, markup in a client name).
+**Not built yet:** the installer creating the KV namespace, the Access
+app and its owner-only policy (the token needs Workers KV Storage: Edit and
+Access: Apps and Policies: Edit, and the account a Zero Trust organization
+with one-time PIN), and `sasonica client` listing and revoking grants.
+
 **The problem.** The connector URL is the only credential, and it opens a
 shell as the owner. URLs travel further than passwords do:
 - they are stored in each assistant's connector settings, so Anthropic's and

@@ -312,7 +312,7 @@ The CI matrix runs these checks on Linux and macOS, including the Mac's system B
 
 ## Deliberate non-features
 
-Sasonica Shell does **not** provide OAuth, per-client permissions, command allowlists, verified identity for which assistant queued a row (the client label says which URL; the agent name is only what the assistant claims), persistent shell sessions, or an agent runtime on the target machine.
+Sasonica Shell does **not** yet provide OAuth (the Worker half is built but off; see docs/tools-and-approvals.md §6), per-client permissions, command allowlists, verified identity for which assistant queued a row (the client label says which URL; the agent name is only what the assistant claims), persistent shell sessions, or an agent runtime on the target machine.
 
 Those omissions are part of the design. If you need richer client identity, session routing, or multi-user policy, see [tmux-relay](https://github.com/davidj4tech/tmux-relay), the larger system from which Sasonica Shell was distilled. The two projects use the same command-signing scheme.
 

@@ -29,7 +29,9 @@
  * repo pins it.
  */
 
-interface Env {
+import { oauthFetch, oauthOn, type OAuthEnv } from './oauth.ts'
+
+export interface Env extends OAuthEnv {
   DB: D1Database
   /** Hex key shared with the runner (relay.key). Set with `wrangler secret put`. */
   SASONICA_HMAC_KEY: string
@@ -768,20 +770,33 @@ async function enqueue(env: Env, command: string, waitSeconds: number, backgroun
   return { row: r.row ?? { id, status: 'pending', exit_code: null, output: null }, timedOut: r.timedOut }
 }
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url)
-    // The path IS the credential: the shared secret, or one of the
-    // per-client ones (clientFor). Every miss is a plain 404, revoked or
-    // unknown alike, so the endpoint cannot be found by probing and a
-    // revoked URL cannot tell that it once worked.
-    const parts = url.pathname.split('/').filter(Boolean)
-    // The runner's own API, on a fixed path behind a Bearer token. Checked
-    // first so it never has to be reachable through the assistant's secret.
-    if (parts.length === 1 && parts[0] === 'runner') return runnerApi(request, env)
-    const target = mcpTarget(url)
-    const client = target ? await clientFor(env, target.secret) : null
-    if (!target || !client) return new Response('not found', { status: 404 })
+/**
+ * Everything but OAuth: the runner's API, and MCP by secret URL. With OAuth
+ * on (./oauth.ts) this still answers every path the OAuth provider does not
+ * own, so the secret URLs keep working beside it until they are revoked.
+ */
+export async function secretFetch(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url)
+  // The path IS the credential: the shared secret, or one of the
+  // per-client ones (clientFor). Every miss is a plain 404, revoked or
+  // unknown alike, so the endpoint cannot be found by probing and a
+  // revoked URL cannot tell that it once worked.
+  const parts = url.pathname.split('/').filter(Boolean)
+  // The runner's own API, on a fixed path behind a Bearer token. Checked
+  // first so it never has to be reachable through the assistant's secret.
+  if (parts.length === 1 && parts[0] === 'runner') return runnerApi(request, env)
+  const target = mcpTarget(url)
+  const client = target ? await clientFor(env, target.secret) : null
+  if (!target || !client) return new Response('not found', { status: 404 })
+  return mcpServe(request, env, client, target.name)
+}
+
+/**
+ * The MCP endpoint, once the caller is known: `client` is who the URL or
+ * the OAuth grant says it is, and labels every row it queues.
+ */
+export async function mcpServe(request: Request, env: Env, client: string, urlName: string | null): Promise<Response> {
+    const target = { name: urlName }
     const scope = sessionScope(client, target.name)
     if (request.method !== 'POST') return new Response('POST JSON-RPC here', { status: 405 })
 
@@ -916,5 +931,10 @@ export default {
       default:
         return rpcError(id, -32601, `unknown method ${JSON.stringify(method)}`)
     }
+}
+
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return oauthOn(env) ? oauthFetch(request, env, ctx) : secretFetch(request, env)
   },
 }

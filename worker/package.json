@@ -10,5 +10,8 @@
     "@cloudflare/workers-types": "^5.20260730.1",
     "typescript": "^5.7.0",
     "wrangler": "^4.115.0"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.1.0"
   }
 }
