@@ -101,6 +101,9 @@ const T = {
   BACKGROUND_MAX: num(cfg.SASONICA_BACKGROUND_MAX, POS, 4),
   CMD_TIMEOUT:    num(cfg.SASONICA_CMD_TIMEOUT, POS, 600),
   POLL:           num(cfg.SASONICA_POLL, POS, 5),
+  // Seconds an idle runner's claim may be held open by the Worker; 0 turns
+  // it off (a plain poll every POLL seconds).
+  LONG_WAIT:      Math.min(num(cfg.SASONICA_LONG_WAIT, NAT, 25), 25),
   PROGRESS_EVERY: num(cfg.SASONICA_PROGRESS_EVERY, NAT, 10),
   KEEP_DAYS:      num(cfg.SASONICA_KEEP_DAYS, POS, 30),
   LOAD_MAX:       num(cfg.SASONICA_LOAD_MAX, DEC, 0),
@@ -936,6 +939,11 @@ function trimNonces() {
   } catch { /* no file yet */ }
 }
 
+/** Whether the last claim was held open by the Worker (then no sleep is
+ *  needed before the next one; an older Worker answers at once, and the
+ *  normal poll interval applies). */
+let lastWaited = false;
+
 async function poll() {
   reloadTunables();
   await publishTools();          // a no-op unless a manifest changed
@@ -946,7 +954,14 @@ async function poll() {
   const fg = T.PARALLEL > 1
     ? Math.max(0, T.PARALLEL - (bgJobs.size + (fgBusy() ? 1 : 0)))
     : (fgBusy() ? 0 : 1);
-  const { rows, signins } = await api('claim', { fg, bg });
+  // Nothing running here: ask with a long wait (the Worker holds the claim
+  // until a row arrives), so an idle machine makes one request per wait
+  // rather than one per poll. While anything runs, the normal short poll,
+  // so a cancel or a detach is picked up promptly.
+  const idle = !fgBusy() && bgJobs.size === 0 && T.LONG_WAIT > 0;
+  const { rows, signins, waited } = await api('claim', {
+    fg, bg, ...(idle ? { wait: T.LONG_WAIT, signins_seen: lastSignins } : {}) });
+  lastWaited = !!waited;
   if (typeof signins === 'number') await noteSignins(signins);
   for (const row of rows) {
     const lane = Number(row.background) === 1 || T.PARALLEL > 1 ? 'bg' : 'fg';
@@ -1034,7 +1049,9 @@ if (sub === '--once') {
       if (Date.now() - lastPrune >= 86_400_000) { lastPrune = Date.now(); await pruneOld(); }
       if (Date.now() - lastStale >= 300_000) { lastStale = Date.now(); await sweepStale(); }
       await poll();
-    } catch (e) { log(`poll failed: ${e.message}`); }
-    await sleep(T.POLL * 1000);
+    } catch (e) { log(`poll failed: ${e.message}`); lastWaited = false; }
+    // After a held claim the next one goes out at once (a short breath, so a
+    // Worker that answers immediately can never make this a hot loop).
+    await sleep(lastWaited ? 250 : T.POLL * 1000);
   }
 }

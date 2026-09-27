@@ -72,6 +72,8 @@ function setup(envLines = {}, ambient = {}) {
     SASONICA_RUNNER_TOKEN: RUNNER_TOKEN,
     SASONICA_RUNNER_ID: 'testrunner',
     SASONICA_DETACH_CHECK: '1',
+    // The loop tests time a plain poll; loopLongWait turns the held claim on.
+    SASONICA_LONG_WAIT: '0',
     ...ambient,
   });
   // The runner logs through console.error; keep it for assertions and out of
@@ -600,6 +602,25 @@ const cases = {
     assert.equal(db.row(2).status, 'pending', 'SASONICA_BACKGROUND_MAX was not honoured');
     assert.ok(await until(() => db.row(2).status === 'done', 20000),
       'the second background row never ran');
+  },
+
+  // Idle, the claim is held open by the Worker: few requests, and a row that
+  // arrives mid-wait still starts within about a second.
+  async loopLongWait() {
+    setup({ SASONICA_POLL: 1, SASONICA_CMD_TIMEOUT: 60 }, { SASONICA_LONG_WAIT: '5' });
+    const db = await start([], 'loop');
+    const inner = globalThis.fetch;
+    let claims = 0;
+    globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith('/runner') && String(init?.body || '').includes('"claim"')) claims++;
+      return inner(url, init);
+    };
+    await sleep(6500);
+    assert.ok(claims <= 3, `an idle runner made ${claims} claims in 6.5 s (a 1 s poll would make ~6)`);
+    const t0 = Date.now();
+    db.add({ ...job(C.noop) });
+    assert.ok(await until(() => db.row(1).status === 'done', 4000), 'the row never ran');
+    assert.ok(Date.now() - t0 < 3000, `it waited ${Date.now() - t0} ms to start`);
   },
 
   // Editing the env file is live within one poll.

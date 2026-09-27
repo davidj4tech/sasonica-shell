@@ -603,6 +603,10 @@ async function ownerGrants(env: Env): Promise<{ id: string; userId: string; labe
   return out
 }
 
+/** The longest a runner's claim is held open (seconds): under the runner's
+ *  60 s request timeout, and short enough that a dropped connection is noticed. */
+const LONG_WAIT_MAX = 25
+
 /** How long a sign-in waits for the owner, as SQLite's modifier. */
 export const SIGNIN_WINDOW = '-10 minutes'
 
@@ -660,8 +664,24 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
       const bg = Math.min(Math.max(Number(body?.bg) || 0, 0), CLAIM_LIMIT)
       // Sign-ins waiting for the owner (SASONICA_SIGNIN=app): the count rides
       // every claim, so the runner asks for the list only when it moves.
-      const signins = await pendingSignins(env)
+      let signins = await pendingSignins(env)
       if (!fg && !bg) return runnerJson({ rows: [], signins })
+      // Long wait (an idle runner asks with `wait`): held open until a row
+      // arrives, the sign-ins move, or the wait is up, checking once a second
+      // with a cheap read. An idle machine then costs one request per wait
+      // instead of one per poll — what lets a free account hold ~30 of them —
+      // and a command still starts within about a second (27 Sep 2026).
+      const wait = Math.min(Math.max(Number(body?.wait) || 0, 0), LONG_WAIT_MAX)
+      if (wait) {
+        const seen = Number(body?.signins_seen ?? signins)
+        const deadline = Date.now() + wait * 1000
+        while (Date.now() < deadline && signins === seen) {
+          const any = await env.DB.prepare(`SELECT 1 AS x FROM commands WHERE status = 'pending' LIMIT 1`).first()
+          if (any) break
+          await new Promise((r) => setTimeout(r, 1000))
+          signins = await pendingSignins(env)
+        }
+      }
       const { results = [] } = await env.DB.prepare(
         `UPDATE commands SET status = 'running', runner = ?, updated_at = datetime('now')
          WHERE id IN (
@@ -674,7 +694,7 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
          RETURNING id, command, sig, nonce, COALESCE(background, 0) AS background,
                    COALESCE(kind, 'shell') AS kind`,
       ).bind(runner, fg, bg).all()
-      return runnerJson({ rows: results, signins })
+      return runnerJson({ rows: results, signins, ...(wait ? { waited: wait } : {}) })
     }
     // Sign-ins approved in the app (§6): the waiting ones, and a decision.
     // The decision is signed with SASONICA_HMAC_KEY as well as carried by
