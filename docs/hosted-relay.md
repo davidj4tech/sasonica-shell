@@ -1,6 +1,9 @@
 # Proposal: a hosted relay, for people with no Cloudflare account (27 Sep 2026)
 
-Status: proposed, not built. Answers `umbrella.md`'s open question, "a user
+Status: proposed, not built. **Decided (David, 27 Sep 2026): self-hosting
+is the free tier and what we build and support now; the hosted relay is a
+later middle tier (a small fee against its $5/month running cost), with a
+Sasonica account's premium features above it.** Answers `umbrella.md`'s open question, "a user
 with no Cloudflare account and no domain".
 
 ## Why
