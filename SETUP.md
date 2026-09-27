@@ -267,10 +267,16 @@ Only your email gets through. The secret URL keeps working beside it until
 you stop it.
 
 1. **Zero Trust, once per account** (free): https://one.dash.cloudflare.com →
-   pick a team name; then Settings → Authentication → add **One-time PIN**.
+   pick a team name. A team made since June 2026 signs you in with your
+   Cloudflare login (members of the account only), which is enough; One-time
+   PIN (Integrations → Identity providers) is optional. The owner email below
+   is then your Cloudflare login's.
 2. **Three more token permissions** (section 2), all Account:
    Workers KV Storage: Edit; Access: Apps and Policies: Edit; Access:
    Organizations, Identity Providers, and Groups: Read.
+   An account token (made under the account's own API Tokens) works as well
+   as a personal one. `SASONICA_WORKERS_SUBDOMAIN=<name>` names the account's
+   workers.dev subdomain if it has none yet (else a random `relay-xxxxxx`).
 3. **Re-run the installer with your email**:
    `SASONICA_OWNER_EMAIL=you@example.com sasonica install` (or put it in
    `install.conf`). It creates a KV namespace (`<worker>-oauth`), an Access

@@ -183,8 +183,19 @@ if (!token) {
 if (!token) die('no token given');
 process.env.CLOUDFLARE_API_TOKEN = token;
 
-const verify = await cf('/user/tokens/verify', { token });
-if (verify.status !== 'active') die('the token did not verify');
+// A user token verifies at /user/tokens/verify; an account token (made
+// under an account's API Tokens, as South Pen Labs' is) answers "Invalid API
+// Token" there and verifies at its account's own endpoint instead.
+let tokenOk = false;
+try { tokenOk = (await cfRequest('/user/tokens/verify', { token })).status === 'active'; } catch { tokenOk = false; }
+if (!tokenOk) {
+  let ids = process.env.CLOUDFLARE_ACCOUNT_ID ? [process.env.CLOUDFLARE_ACCOUNT_ID] : [];
+  if (!ids.length) { try { ids = (await cfRequest('/accounts?per_page=50', { token })).map((a) => a.id); } catch { ids = []; } }
+  for (const id of ids) {
+    try { if ((await cfRequest(`/accounts/${id}/tokens/verify`, { token })).status === 'active') { tokenOk = true; break; } } catch { /* next */ }
+  }
+}
+if (!tokenOk) die('the token did not verify (as a user token or an account token)');
 // Listing accounts is the ONLY thing here that needs Account Settings: Read.
 // Given the id, the token can be narrower -- Workers Scripts: Edit and D1:
 // Edit are enough to provision -- which matters because whoever installs
@@ -303,9 +314,14 @@ say('Deploying the Worker');
 // (it checks CLAUDECODE among others), which would make this pass under an
 // assistant and fail for the person who ships it. Doing it ourselves is the
 // same either way.
-let sub = (await cf(`/accounts/${accountId}/workers/subdomain`, { token }))?.subdomain;
+// An account with none answers with an error ("You do not have a workers.dev
+// subdomain"), not an empty one: that is the case to register one.
+let sub = '';
+try { sub = (await cfRequest(`/accounts/${accountId}/workers/subdomain`, { token }))?.subdomain || ''; } catch { sub = ''; }
 if (!sub) {
-  sub = `relay-${hex(3)}`;
+  // SASONICA_WORKERS_SUBDOMAIN picks it (it is in every Worker URL on the
+  // account, so a name beats a random one); else a random relay-xxxxxx.
+  sub = process.env.SASONICA_WORKERS_SUBDOMAIN || `relay-${hex(3)}`;
   await cf(`/accounts/${accountId}/workers/subdomain`, { method: 'PUT', body: { subdomain: sub }, token });
   note(`registered workers.dev subdomain: ${sub}`);
 }
@@ -447,7 +463,8 @@ ${ownerEmail ? `
         ${workerUrl}/mcp
 
     Add it as a custom connector with no secret in it; the assistant opens a
-    page to allow it, then Cloudflare emails you a code. Once every assistant
+    page to allow it, then Cloudflare Access signs you in (your Cloudflare
+    login, or an emailed code if you added One-time PIN). Once every assistant
     signs in, stop the secret URL: sasonica client revoke default
     Signed-in assistants: sasonica client grants
 ` : ''}
