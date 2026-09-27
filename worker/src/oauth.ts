@@ -141,7 +141,7 @@ function consentPage(clientName: string, clientId: string, redirectUri: string, 
 <p>It will be able to run any shell command there, as you. ${origin} Its access goes to <strong>${escape(host)}</strong>.</p>
 ${local ? '<p class="warn"><strong>That is an app on this computer.</strong> Continue only if you just started connecting from it.</p>' : ''}
 <p>${next}</p>
-<form method="post">
+<form method="post" onsubmit="var b=this.querySelectorAll('button');setTimeout(function(){for(var i=0;i<b.length;i++)b[i].disabled=true},0)">
   <input type="hidden" name="handle" value="${escape(handle)}">
   <p><button name="decision" value="approve">Allow</button> <button name="decision" value="deny">Deny</button></p>
 </form>`
@@ -227,7 +227,19 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
         denied.headers.set('Location', denied.redirectTo)
         return new Response(null, { status: 302, headers: denied.headers })
       }
-      const approved = await oauth.approveConsent(request, handle, { scope: [SCOPE] })
+      let approved
+      try {
+        approved = await oauth.approveConsent(request, handle, { scope: [SCOPE] })
+      } catch (e) {
+        // Already allowed in this browser and still waiting (a double tap, a
+        // resubmitted form): back to the waiting page, not an error.
+        const waitingId = /(?:^|;\s*)__Host-sasonica-signin=([0-9a-f]{32})/.exec(request.headers.get('Cookie') || '')?.[1]
+        if (signinMode(env) === 'app' && waitingId && e instanceof AuthorizationError) {
+          const row = await env.DB.prepare(`SELECT status FROM signins WHERE id = ?`).bind(waitingId).first<{ status: string }>()
+          if (row?.status === 'pending') return Response.redirect(`${url.origin}/signin/wait?id=${waitingId}`, 303)
+        }
+        throw e
+      }
       if (signinMode(env) === 'app') {
         // The phone says yes: a row the runner reports and the app decides,
         // bound to this browser by the upstream state's cookie.
@@ -244,6 +256,8 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
         // Post/redirect/get: a reload of the waiting page, or a tab brought
         // back from the background, must not resubmit the consent form.
         headers.set('Location', `/signin/wait?id=${id}`)
+        // A second Allow (a double tap, a resubmitted form) finds its way back here.
+        headers.append('Set-Cookie', `__Host-sasonica-signin=${id}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600`)
         return new Response(null, { status: 303, headers })
       }
       const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)))

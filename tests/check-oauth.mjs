@@ -336,6 +336,11 @@ const cases = {
     const html = await waiting.text();
     // A reload of the waiting page is the same page, not a used handle.
     assert.equal((await b.go(posted.headers.get('location'), { env })).status, 200);
+    // A second Allow (a double tap) goes back to the waiting page, not an error.
+    const again = await b.go('/authorize', { env, method: 'POST', body: new URLSearchParams({ handle, decision: 'approve' }), headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+    assert.equal(again.status, 303);
+    assert.equal(new URL(again.headers.get('location'), ORIGIN).pathname + new URL(again.headers.get('location'), ORIGIN).search, posted.headers.get('location'));
+    assert.match(consent, /onsubmit=/, 'Allow locks after one tap');
     const code = html.match(/letter-spacing:\.2em">([A-Z0-9]{6})</)[1];
     const id = html.match(/signin\/status\?id=([0-9a-f]{32})/)[1];
     const state = new URLSearchParams(html.match(/\/callback\?([^"]+)"/)[1]).get('state');
