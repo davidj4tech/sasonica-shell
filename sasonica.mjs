@@ -978,14 +978,19 @@ async function noteSignins(n) {
   if (n <= 0) { if (was > 0) agentAlert(['report', id, '--level', 'ok', '--quiet']); return; }
   let rows = [];
   try { ({ signins: rows = [] } = await api('signins')); } catch { rows = []; }
+  // One notification that says where to go, and nothing else: --quiet keeps
+  // it off the desk's pane and out of speech (the store still notifies the
+  // phone, and files no TODO for a sign-in). A new user reads it and knows
+  // what to open (David, 27 Sep 2026).
   const first = rows[0] || {};
   const who = first.client_name || 'An assistant';
-  const title = rows.length > 1
-    ? `${rows.length} sign-ins waiting for ${RUNNER_ID}'s shell`
-    : `${who} wants to use ${RUNNER_ID}'s shell (code ${first.code || '?'})`;
-  const detail = rows.map((r) => `${r.client_name || '?'} → ${r.client_host || '?'}, code ${r.code}`).join('\n');
-  agentAlert(['report', id, '--level', 'needs', '--title', title, '--detail', detail,
-    '--fix', 'Approve it in Sasonica, on Home, if the code matches the sign-in page', '--host', RUNNER_ID]);
+  const title = rows.length > 1 ? `Approve ${rows.length} sign-ins in Sasonica` : 'Approve a sign-in in Sasonica';
+  const detail = rows.length > 1
+    ? `${rows.map((r) => `${r.client_name || 'An assistant'} (code ${r.code})`).join(', ')} want to use ${RUNNER_ID}'s shell. `
+      + 'Open Sasonica: they are at the top of Home, under Sign-in requests. Approve each only if its code matches its sign-in page.'
+    : `${who} wants to use ${RUNNER_ID}'s shell. Open Sasonica: at the top of Home, under Sign-in requests, `
+      + `approve code ${first.code || '?'} if it matches the sign-in page.`;
+  agentAlert(['report', id, '--level', 'needs', '--title', title, '--detail', detail, '--host', RUNNER_ID, '--quiet']);
   log(`sign-in waiting: ${rows.map((r) => `${r.client_name} (${r.code})`).join(', ')}`);
 }
 
