@@ -29,7 +29,7 @@
  * `client` on a row it queues is that registration (`oauth-claude`), and
  * revoking one grant leaves the others working.
  */
-import { mcpServe, secretFetch, type Env } from './index.ts'
+import { mcpServe, randomHex, secretFetch, SIGNIN_WINDOW, type Env } from './index.ts'
 
 export interface OAuthEnv {
   /** KV for the provider's clients, grants and tokens. */
@@ -41,13 +41,52 @@ export interface OAuthEnv {
   ACCESS_TEAM_DOMAIN?: string
   /** The one email that may authorize a connector. */
   SASONICA_OWNER_EMAIL?: string
+  /**
+   * Who says yes: "access" (Cloudflare Access, the owner's login) or "app"
+   * (the owner's paired Sasonica app approves a code the page shows — no
+   * Cloudflare account needed; David, 27 Sep 2026). Unset is "access".
+   */
+  SASONICA_SIGNIN?: string
+}
+
+export function signinMode(env: OAuthEnv): 'access' | 'app' {
+  return env.SASONICA_SIGNIN === 'app' ? 'app' : 'access'
+}
+
+/** The user every grant belongs to: the owner's email under Access, "owner" when the app approves. */
+export function ownerId(env: OAuthEnv): string {
+  return signinMode(env) === 'app' ? 'owner' : String(env.SASONICA_OWNER_EMAIL || '').trim().toLowerCase()
 }
 
 /** Scope a connector is granted. One scope: the shell is all or nothing. */
 const SCOPE = 'shell'
 
 export function oauthOn(env: OAuthEnv): boolean {
-  return !!(env.OAUTH_KV && env.ACCESS_CLIENT_ID && env.ACCESS_CLIENT_SECRET && env.ACCESS_TEAM_DOMAIN && env.SASONICA_OWNER_EMAIL)
+  if (!env.OAUTH_KV) return false
+  if (signinMode(env) === 'app') return true
+  return !!(env.ACCESS_CLIENT_ID && env.ACCESS_CLIENT_SECRET && env.ACCESS_TEAM_DOMAIN && env.SASONICA_OWNER_EMAIL)
+}
+
+/** A code to read off one screen and find on another: no 0/O, 1/I/L. */
+function signinCode(): string {
+  const abc = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+  const b = crypto.getRandomValues(new Uint8Array(6))
+  return [...b].map((x) => abc[x % abc.length]).join('')
+}
+
+/** The page that waits for the phone: the code, and a poll of /signin/status. */
+function waitPage(code: string, id: string, state: string, machine: string, clientName: string): string {
+  const next = `/callback?${new URLSearchParams({ state, signin: id })}`
+  return `<h1>Approve on your phone</h1>
+<p>Open Sasonica on the phone paired with ${escape(machine)}, and approve the sign-in for <strong>${escape(clientName)}</strong> showing this code:</p>
+<p style="font:600 2rem ui-monospace,monospace;letter-spacing:.2em">${escape(code)}</p>
+<p id="s">Waiting… (this page carries on by itself)</p>
+<script>
+(function(){var t=setInterval(function(){fetch('/signin/status?id=${id}').then(function(r){return r.json()}).then(function(j){
+if(j.status==='approved'){clearInterval(t);location.replace(${JSON.stringify(next)})}
+else if(j.status==='denied'||j.status==='expired'){clearInterval(t);location.replace(${JSON.stringify(next)})}
+}).catch(function(){})},2000)})();
+</script>`
 }
 
 /** The Access OIDC endpoints for this app (Access for SaaS, generic OIDC). */
@@ -83,7 +122,8 @@ ${body}`
   return new Response(html, { status, headers })
 }
 
-function consentPage(clientName: string, clientId: string, redirectUri: string, handle: string, machine: string): string {
+function consentPage(clientName: string, clientId: string, redirectUri: string, handle: string, machine: string,
+                     next = 'Next, Cloudflare Access checks that it is you.'): string {
   const name = escape(clientName || clientId)
   const host = new URL(redirectUri).hostname
   const local = /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/.test(host)
@@ -93,7 +133,7 @@ function consentPage(clientName: string, clientId: string, redirectUri: string, 
   return `<h1>Allow ${name} to run commands on ${escape(machine)}?</h1>
 <p>It will be able to run any shell command there, as you. ${origin} Its access goes to <strong>${escape(host)}</strong>.</p>
 ${local ? '<p class="warn"><strong>That is an app on this computer.</strong> Continue only if you just started connecting from it.</p>' : ''}
-<p>Next, Cloudflare Access checks that it is you.</p>
+<p>${next}</p>
 <form method="post">
   <input type="hidden" name="handle" value="${escape(handle)}">
   <p><button name="decision" value="approve">Allow</button> <button name="decision" value="deny">Deny</button></p>
@@ -167,7 +207,10 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
       const client = await oauth.lookupClient(req.clientId)
       if (!client) return page('Unknown app', '<p>That app is not registered here.</p>', undefined, 400)
       const consent = await oauth.beginConsent(req)
-      return page('Allow access?', consentPage(client.clientName, client.clientId, req.redirectUri, consent.handle, machineName(url)), consent.headers)
+      const next = signinMode(env) === 'app'
+        ? 'Next, you approve it in the Sasonica app on your phone.'
+        : 'Next, Cloudflare Access checks that it is you.'
+      return page('Allow access?', consentPage(client.clientName, client.clientId, req.redirectUri, consent.handle, machineName(url), next), consent.headers)
     }
     if (url.pathname === '/authorize' && request.method === 'POST') {
       const form = await request.formData()
@@ -178,6 +221,21 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
         return new Response(null, { status: 302, headers: denied.headers })
       }
       const approved = await oauth.approveConsent(request, handle, { scope: [SCOPE] })
+      if (signinMode(env) === 'app') {
+        // The phone says yes: a row the runner reports and the app decides,
+        // bound to this browser by the upstream state's cookie.
+        const { state, headers } = await oauth.beginUpstream(approved.request, { data: {}, headers: approved.headers })
+        const client = await oauth.lookupClient(approved.request.clientId)
+        const id = randomHex(16)
+        const code = signinCode()
+        const name = String(client?.clientName || approved.request.clientId).slice(0, 80)
+        await env.DB.prepare(`DELETE FROM signins WHERE created_at < datetime('now', '-1 day')`).run()
+        await env.DB.prepare(
+          `INSERT INTO signins (id, code, client_name, client_host, state, status, created_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))`,
+        ).bind(id, code, name, new URL(approved.request.redirectUri).hostname, state).run()
+        return page('Approve on your phone', waitPage(code, id, state, machineName(url), name), headers)
+      }
       const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)))
       const { state, headers } = await oauth.beginUpstream(approved.request, { data: { verifier }, headers: approved.headers })
       const to = new URL(accessEndpoints(env).authorization)
@@ -191,6 +249,18 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
       headers.set('Location', to.href)
       return new Response(null, { status: 302, headers })
     }
+    if (url.pathname === '/signin/status' && request.method === 'GET') {
+      // The waiting page's poll. The id is 128 random bits; the answer is only
+      // pending / approved / denied / expired, never the code or the client.
+      const id = url.searchParams.get('id') || ''
+      const row = /^[0-9a-f]{32}$/.test(id)
+        ? await env.DB.prepare(
+            `SELECT status, created_at > datetime('now', ?) AS fresh FROM signins WHERE id = ?`,
+          ).bind(SIGNIN_WINDOW, id).first<{ status: string; fresh: number }>()
+        : null
+      const status = !row ? 'expired' : row.status === 'pending' && !row.fresh ? 'expired' : row.status
+      return Response.json({ status }, { headers: { 'Cache-Control': 'no-store' } })
+    }
     if (url.pathname === '/callback' && request.method === 'GET') {
       const { request: original, data, headers } = await oauth.finishUpstream(request)
       const deny = (why: string) => {
@@ -203,6 +273,30 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
         return new Response(null, { status: 302, headers })
       }
       if (url.searchParams.get('error')) return deny(`Access said ${url.searchParams.get('error')}`)
+      if (signinMode(env) === 'app') {
+        // Approved on the phone, for this very sign-in (its state), in time.
+        const sid = url.searchParams.get('signin') || ''
+        const row = /^[0-9a-f]{32}$/.test(sid)
+          ? await env.DB.prepare(
+              `SELECT status, state, created_at > datetime('now', ?) AS fresh FROM signins WHERE id = ?`,
+            ).bind(SIGNIN_WINDOW, sid).first<{ status: string; state: string; fresh: number }>()
+          : null
+        if (row) await env.DB.prepare(`DELETE FROM signins WHERE id = ?`).bind(sid).run()
+        if (!row || row.state !== url.searchParams.get('state')) return deny('no such sign-in')
+        if (row.status !== 'approved') return deny(`the phone said ${row.status}`)
+        if (!row.fresh) return deny('approved too late')
+        const client = await oauth.lookupClient(original.clientId)
+        const label = grantLabel(client?.clientName, original.clientId)
+        const { redirectTo } = await oauth.completeAuthorization({
+          request: original,
+          userId: ownerId(env),
+          metadata: { label, clientName: client?.clientName || '' },
+          scope: [SCOPE],
+          props: { client: label } satisfies GrantProps,
+        })
+        headers.set('Location', redirectTo)
+        return new Response(null, { status: 302, headers })
+      }
       const res = await fetch(accessEndpoints(env).token, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },

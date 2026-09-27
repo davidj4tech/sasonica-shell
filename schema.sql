@@ -66,3 +66,20 @@ CREATE TABLE IF NOT EXISTS tools (
 -- tool, its arguments and the manifest it was made against). ALTER TABLE is
 -- not idempotent in SQLite, so install.sh adds it to an older database:
 -- ALTER TABLE commands ADD COLUMN kind TEXT NOT NULL DEFAULT 'shell';
+
+-- Sign-in approved in the Sasonica app (docs/tools-and-approvals.md §6,
+-- SASONICA_SIGNIN=app): a connector's sign-in waits here, with a short code
+-- the page shows, until the owner approves or denies it on the phone. The
+-- runner sees the pending count on every claim; red5's server asks for the
+-- list and signs the decision with relay.key. `state` is the OAuth state the
+-- page's own browser holds, so an approval completes only that sign-in.
+CREATE TABLE IF NOT EXISTS signins (
+  id          TEXT PRIMARY KEY,           -- 32 hex, unguessable: the page polls by it
+  code        TEXT NOT NULL,              -- 6 letters/digits, shown on the page and in the app
+  client_name TEXT,                       -- what the assistant calls itself (unverified)
+  client_host TEXT,                       -- where its access goes (the redirect's host)
+  state       TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pending', -- pending | approved | denied
+  created_at  TEXT NOT NULL,
+  decided_at  TEXT
+);

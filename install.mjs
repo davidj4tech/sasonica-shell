@@ -147,6 +147,15 @@ const dbName = process.env.SASONICA_DB_NAME || existing.SASONICA_DB_NAME || `sas
 // given: the connector then signs in with Cloudflare Access instead of
 // carrying a secret. Kept in the env file, so a re-run keeps it on.
 const ownerEmail = (process.env.SASONICA_OWNER_EMAIL || existing.SASONICA_OWNER_EMAIL || '').trim().toLowerCase();
+// SASONICA_SIGNIN=app: the owner's paired Sasonica app approves each sign-in
+// (a code on the page) instead of Cloudflare Access — no Cloudflare login and
+// no Access setup; only the KV namespace. Kept in the env file too.
+const signin = (process.env.SASONICA_SIGNIN || existing.SASONICA_SIGNIN || (ownerEmail ? 'access' : '')).trim();
+if (signin && !['app', 'access'].includes(signin)) {
+  console.error(`SASONICA_SIGNIN is 'app' or 'access', not ${signin}`);
+  process.exit(1);
+}
+const oauth = signin === 'app' || !!ownerEmail;
 if (ownerEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(ownerEmail)) {
   console.error(`SASONICA_OWNER_EMAIL is not an email: ${ownerEmail}`);
   process.exit(1);
@@ -172,7 +181,7 @@ if (!token) {
       3. Name it sasonica and add three permissions, all "Account":
             Workers Scripts   Edit
             D1                Edit
-            Account Settings  Read${ownerEmail ? `
+            Account Settings  Read${oauth && signin !== 'app' ? `
          and, for OAuth sign-in (SASONICA_OWNER_EMAIL is set), two more:
             Workers KV Storage            Edit
             Access: Apps and Policies     Edit
@@ -232,7 +241,7 @@ if (!/^[0-9a-f-]{36}$/.test(dbId ?? '')) die('could not get a database id');
 // The provider's clients, grants and tokens. It encrypts what a grant carries,
 // so the namespace alone cannot mint access.
 let kvId = '';
-if (ownerEmail) {
+if (oauth) {
   const title = `${workerName}-oauth`;
   say(`OAuth: KV namespace '${title}'`);
   const spaces = await cf(`/accounts/${accountId}/storage/kv/namespaces?per_page=100`, { token });
@@ -328,7 +337,11 @@ if (!sub) {
 const workerUrl = `https://${workerName}.${sub}.workers.dev`;
 
 // --- 6b. OAuth: the Access app that signs the owner in (only with SASONICA_OWNER_EMAIL)
-if (ownerEmail) {
+if (signin === 'app') {
+  say('OAuth: sign-in approved in the Sasonica app');
+  if (wrangler(['secret', 'put', 'SASONICA_SIGNIN'], { stdin: 'app', capture: true }).code !== 0) die('setting SASONICA_SIGNIN failed');
+  note('each sign-in waits for Approve on the paired phone (Home)');
+} else if (ownerEmail) {
   say('OAuth: Cloudflare Access sign-in');
   let org = null;
   try { org = await cfRequest(`/accounts/${accountId}/access/organizations`, { token }); } catch { org = null; }
@@ -381,7 +394,7 @@ say(`Writing ${ENV_FILE}`);
 // through the Worker, and a D1 API token is account-wide: one left on every
 // machine would reach every other machine's queue.
 writeText(ENV_FILE, renderEnv({
-  accountId, site, workerName, dbName, dbId, secret, workerUrl, runnerToken, keyFile: KEY_FILE, ownerEmail,
+  accountId, site, workerName, dbName, dbId, secret, workerUrl, runnerToken, keyFile: KEY_FILE, ownerEmail, signin: signin === 'app' ? 'app' : '',
 }), 0o600);
 mkdirSync(path.join(CONF, 'skills'), { recursive: true });
 
@@ -457,7 +470,16 @@ console.log(`
 note(`Open ${connectors} in a browser (sign in if it asks).`);
 console.log(`    There: Add custom connector -> paste the URL -> no authentication -> save.
     Then ask Claude to run a command, e.g. "run hostname on my machine".
-${ownerEmail ? `
+${signin === 'app' ? `
+    Or sign in instead of a secret (OAuth, approved in the Sasonica app):
+
+        ${workerUrl}/mcp
+
+    Add it as a custom connector with no secret in it; the assistant opens a
+    page to allow it, which shows a code; approve that code in Sasonica on the
+    paired phone (Home). Once every assistant signs in, stop the secret URL:
+    sasonica client revoke default
+` : ''}${ownerEmail && signin !== 'app' ? `
     Or sign in instead of a secret (OAuth; only ${ownerEmail} gets through):
 
         ${workerUrl}/mcp

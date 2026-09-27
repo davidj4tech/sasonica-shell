@@ -29,7 +29,7 @@
  * repo pins it.
  */
 
-import { oauthFetch, oauthOn, type OAuthEnv } from './oauth.ts'
+import { oauthFetch, oauthOn, ownerId, type OAuthEnv } from './oauth.ts'
 
 export interface Env extends OAuthEnv {
   DB: D1Database
@@ -74,12 +74,12 @@ export async function hmacHex(keyText: string, message: string): Promise<string>
   const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message))
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
-function randomHex(bytes: number): string {
+export function randomHex(bytes: number): string {
   const a = new Uint8Array(bytes)
   crypto.getRandomValues(a)
   return [...a].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
-function timingSafeEqual(a: string, b: string): boolean {
+export function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false
   let d = 0
   for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i)
@@ -588,8 +588,9 @@ function runnerJson(body: unknown, status = 200): Response {
 /** The owner's OAuth grants, or null when OAuth is off (no provider helpers in env). */
 async function ownerGrants(env: Env): Promise<{ id: string; userId: string; label: string; clientName: string; createdAt: number }[] | null> {
   const helpers = (env as any).OAUTH_PROVIDER
-  if (!helpers || !env.SASONICA_OWNER_EMAIL) return null
-  const owner = env.SASONICA_OWNER_EMAIL.trim().toLowerCase()
+  if (!helpers) return null
+  const owner = ownerId(env)
+  if (!owner) return null
   const out = []
   let cursor: string | undefined
   do {
@@ -600,6 +601,21 @@ async function ownerGrants(env: Env): Promise<{ id: string; userId: string; labe
     cursor = page.cursor
   } while (cursor)
   return out
+}
+
+/** How long a sign-in waits for the owner, as SQLite's modifier. */
+export const SIGNIN_WINDOW = '-10 minutes'
+
+/** Sign-ins waiting for the owner; 0 on a database from before the table. */
+async function pendingSignins(env: Env): Promise<number> {
+  try {
+    const r = await env.DB.prepare(
+      `SELECT count(*) AS n FROM signins WHERE status = 'pending' AND created_at > datetime('now', ?)`,
+    ).bind(SIGNIN_WINDOW).first<{ n: number }>()
+    return Number(r?.n ?? 0)
+  } catch {
+    return 0
+  }
 }
 
 export async function runnerApi(request: Request, env: Env): Promise<Response> {
@@ -642,7 +658,10 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
     case 'claim': {
       const fg = Math.min(Math.max(Number(body?.fg) || 0, 0), CLAIM_LIMIT)
       const bg = Math.min(Math.max(Number(body?.bg) || 0, 0), CLAIM_LIMIT)
-      if (!fg && !bg) return runnerJson({ rows: [] })
+      // Sign-ins waiting for the owner (SASONICA_SIGNIN=app): the count rides
+      // every claim, so the runner asks for the list only when it moves.
+      const signins = await pendingSignins(env)
+      if (!fg && !bg) return runnerJson({ rows: [], signins })
       const { results = [] } = await env.DB.prepare(
         `UPDATE commands SET status = 'running', runner = ?, updated_at = datetime('now')
          WHERE id IN (
@@ -655,7 +674,35 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
          RETURNING id, command, sig, nonce, COALESCE(background, 0) AS background,
                    COALESCE(kind, 'shell') AS kind`,
       ).bind(runner, fg, bg).all()
-      return runnerJson({ rows: results })
+      return runnerJson({ rows: results, signins })
+    }
+    // Sign-ins approved in the app (§6): the waiting ones, and a decision.
+    // The decision is signed with SASONICA_HMAC_KEY as well as carried by
+    // the runner's token: granting a connector is granting a shell, and the
+    // key is what already stands between the database and running anything.
+    case 'signins': {
+      let rows: unknown[] = []
+      try {
+        rows = (await env.DB.prepare(
+          `SELECT id, code, client_name, client_host, created_at FROM signins
+            WHERE status = 'pending' AND created_at > datetime('now', ?) ORDER BY created_at`,
+        ).bind(SIGNIN_WINDOW).all()).results ?? []
+      } catch { rows = [] }
+      return runnerJson({ signins: rows })
+    }
+    case 'signin-decide': {
+      const sid = String(body?.id ?? '')
+      const decision = body?.approve === true ? 'approve' : 'deny'
+      const want = await hmacHex(env.SASONICA_HMAC_KEY, `signin\n${sid}\n${decision}`)
+      if (!/^[0-9a-f]{32}$/.test(sid) || !timingSafeEqual(String(body?.sig ?? ''), want)) {
+        return runnerJson({ error: 'bad signature' }, 403)
+      }
+      const r = await env.DB.prepare(
+        `UPDATE signins SET status = ?, decided_at = datetime('now')
+          WHERE id = ? AND status = 'pending' AND created_at > datetime('now', ?)`,
+      ).bind(decision === 'approve' ? 'approved' : 'denied', sid, SIGNIN_WINDOW).run()
+      if (!r.meta.changes) return runnerJson({ error: 'no such sign-in waiting' }, 404)
+      return runnerJson({ id: sid, status: decision === 'approve' ? 'approved' : 'denied' })
     }
 
     // One tick of the watcher: store whatever the job has printed so far and

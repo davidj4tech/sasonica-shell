@@ -946,13 +946,47 @@ async function poll() {
   const fg = T.PARALLEL > 1
     ? Math.max(0, T.PARALLEL - (bgJobs.size + (fgBusy() ? 1 : 0)))
     : (fgBusy() ? 0 : 1);
-  const { rows } = await api('claim', { fg, bg });
+  const { rows, signins } = await api('claim', { fg, bg });
+  if (typeof signins === 'number') await noteSignins(signins);
   for (const row of rows) {
     const lane = Number(row.background) === 1 || T.PARALLEL > 1 ? 'bg' : 'fg';
     track(await runOne(row), lane);
   }
   trimNonces();
   return rows.length;
+}
+
+// --- sign-ins waiting for the owner (SASONICA_SIGNIN=app, §6) ---------------------
+// The count rides every claim. When it moves, the waiting ones become one
+// "needs you" alert on this machine's alert store (agent-alert, where the
+// agent-media server is), so the phone is told and Home shows Approve; none
+// waiting clears it. No agent-alert here: nothing to tell, and the owner
+// approves from a machine that has one.
+let lastSignins = 0;
+function agentAlert(args) {
+  const exe = [path.join(homedir(), '.local', 'bin', 'agent-alert'), '/usr/local/bin/agent-alert'].find((p) => existsSync(p));
+  if (!exe) return;
+  const p = spawn(exe, args, { stdio: 'ignore', detached: false });
+  p.on('error', () => {});
+}
+async function noteSignins(n) {
+  if (n === lastSignins) return;
+  const was = lastSignins;
+  lastSignins = n;
+  const id = `shell.signin.${RUNNER_ID.toLowerCase().replace(/[^a-z0-9._:-]/g, '-')}`;
+  // A clear only after a raise: nothing is reported for a quiet start.
+  if (n <= 0) { if (was > 0) agentAlert(['report', id, '--level', 'ok', '--quiet']); return; }
+  let rows = [];
+  try { ({ signins: rows = [] } = await api('signins')); } catch { rows = []; }
+  const first = rows[0] || {};
+  const who = first.client_name || 'An assistant';
+  const title = rows.length > 1
+    ? `${rows.length} sign-ins waiting for ${RUNNER_ID}'s shell`
+    : `${who} wants to use ${RUNNER_ID}'s shell (code ${first.code || '?'})`;
+  const detail = rows.map((r) => `${r.client_name || '?'} → ${r.client_host || '?'}, code ${r.code}`).join('\n');
+  agentAlert(['report', id, '--level', 'needs', '--title', title, '--detail', detail,
+    '--fix', 'Approve it in Sasonica, on Home, if the code matches the sign-in page', '--host', RUNNER_ID]);
+  log(`sign-in waiting: ${rows.map((r) => `${r.client_name} (${r.code})`).join(', ')}`);
 }
 
 // --- maintenance -------------------------------------------------------------

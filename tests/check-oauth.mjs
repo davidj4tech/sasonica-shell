@@ -11,7 +11,7 @@
 // has; a loader hook gives Node an empty stand-in for it.
 import assert from 'node:assert/strict';
 import { register } from 'node:module';
-import { createHash, generateKeyPairSync, createSign, randomBytes } from 'node:crypto';
+import { createHash, createHmac, generateKeyPairSync, createSign, randomBytes } from 'node:crypto';
 import { fakeD1 } from './fake-d1.mjs';
 
 register('data:text/javascript,' + encodeURIComponent(`
@@ -312,6 +312,72 @@ const cases = {
       method: 'POST', headers: { authorization: 'Bearer runner-token' }, body: JSON.stringify({ op: 'grants' }),
     }), off, ctx)).json();
     assert.equal(r.grants, null);
+  },
+
+  // SASONICA_SIGNIN=app: no Cloudflare login; the page shows a code, the
+  // runner sees it waiting, and a decision signed with relay.key settles it.
+  async appApprovalSignsIn() {
+    reset();
+    const f = fakeD1([]);
+    const env = envFor(f.binding, { SASONICA_SIGNIN: 'app', SASONICA_RUNNER_TOKEN: 'runner-token', ACCESS_CLIENT_ID: undefined, SASONICA_OWNER_EMAIL: undefined });
+    const runner = async (body) => (await worker.fetch(new Request(ORIGIN + '/runner', {
+      method: 'POST', headers: { authorization: 'Bearer runner-token', 'content-type': 'application/json' }, body: JSON.stringify(body),
+    }), env, ctx)).json();
+    const sig = (id, approve) => createHmac('sha256', env.SASONICA_HMAC_KEY).update(`signin\n${id}\n${approve ? 'approve' : 'deny'}`).digest('hex');
+    const clientId = await register_(env);
+    const b = browser();
+    const consent = await (await b.go(authorizeUrl(clientId), { env })).text();
+    assert.match(consent, /approve it in the Sasonica app/);
+    const handle = consent.match(/name="handle" value="([^"]+)"/)[1];
+    const waiting = await b.go('/authorize', { env, method: 'POST', body: new URLSearchParams({ handle, decision: 'approve' }), headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+    assert.equal(waiting.status, 200);
+    const html = await waiting.text();
+    const code = html.match(/letter-spacing:\.2em">([A-Z0-9]{6})</)[1];
+    const id = html.match(/signin\/status\?id=([0-9a-f]{32})/)[1];
+    const state = new URLSearchParams(html.match(/\/callback\?([^"]+)"/)[1]).get('state');
+    const status = async () => (await (await worker.fetch(new Request(`${ORIGIN}/signin/status?id=${id}`), env, ctx)).json()).status;
+    assert.equal(await status(), 'pending');
+    assert.equal((await runner({ op: 'claim', fg: 0, bg: 0 })).signins, 1, 'the runner sees one waiting');
+    const list = (await runner({ op: 'signins' })).signins;
+    assert.deepEqual(list.map((r) => [r.id, r.code, r.client_name, r.client_host]), [[id, code, 'Claude', 'claude.ai']]);
+    assert.equal((await runner({ op: 'signin-decide', id, approve: true, sig: sig(id, false) })).error, 'bad signature');
+    assert.equal((await runner({ op: 'signin-decide', id, approve: true, sig: 'f'.repeat(64) })).error, 'bad signature');
+    assert.equal((await runner({ op: 'signin-decide', id, approve: true, sig: sig(id, true) })).status, 'approved');
+    assert.equal(await status(), 'approved');
+    // Another browser holding the link gets nowhere: the state's cookie is this one's.
+    const other = await browser().go(`/callback?${new URLSearchParams({ state, signin: id })}`, { env });
+    assert.equal(other.status, 400);
+    const back = await b.go(`/callback?${new URLSearchParams({ state, signin: id })}`, { env });
+    assert.equal(back.status, 302);
+    const to = new URL(back.headers.get('location'));
+    assert.equal(to.origin + to.pathname, REDIRECT);
+    const t = await token(env, clientId, to.searchParams.get('code'));
+    assert.equal(t.status, 200);
+    const r = await rpc(env, t.body.access_token, 'tools/call', { name: 'run_command', arguments: { command: 'id', wait: 0 } });
+    assert.equal(r.status, 200);
+    assert.equal(f.row(1).client, 'oauth-claude');
+    assert.equal(await status(), 'expired', 'used once, then gone');
+    assert.equal((await runner({ op: 'grants' })).grants[0].label, 'oauth-claude', 'the grant is the owner\'s');
+  },
+
+  async appDenialRefuses() {
+    reset();
+    const env = envFor(fakeD1([]).binding, { SASONICA_SIGNIN: 'app', SASONICA_RUNNER_TOKEN: 'runner-token', ACCESS_CLIENT_ID: undefined });
+    const b = browser();
+    const consent = await (await b.go(authorizeUrl(await register_(env)), { env })).text();
+    const handle = consent.match(/name="handle" value="([^"]+)"/)[1];
+    const html = await (await b.go('/authorize', { env, method: 'POST', body: new URLSearchParams({ handle, decision: 'approve' }), headers: { 'content-type': 'application/x-www-form-urlencoded' } })).text();
+    const id = html.match(/signin\/status\?id=([0-9a-f]{32})/)[1];
+    const state = new URLSearchParams(html.match(/\/callback\?([^"]+)"/)[1]).get('state');
+    const sig = createHmac('sha256', env.SASONICA_HMAC_KEY).update(`signin\n${id}\ndeny`).digest('hex');
+    const d = await (await worker.fetch(new Request(ORIGIN + '/runner', { method: 'POST', headers: { authorization: 'Bearer runner-token' }, body: JSON.stringify({ op: 'signin-decide', id, approve: false, sig }) }), env, ctx)).json();
+    assert.equal(d.status, 'denied');
+    const back = await b.go(`/callback?${new URLSearchParams({ state, signin: id })}`, { env });
+    const to = new URL(back.headers.get('location'));
+    assert.equal(to.searchParams.get('error'), 'access_denied');
+    assert.equal(to.searchParams.get('code'), null);
+    // Waiting past the window: an approval that arrives then is refused.
+    assert.equal((await (await worker.fetch(new Request(`${ORIGIN}/signin/status?id=${'0'.repeat(32)}`), env, ctx)).json()).status, 'expired');
   },
 
   async grantLabels() {

@@ -271,6 +271,18 @@ but it is the one that makes interactive use (§4) feel immediate.
 
 ## 6. Sign-in instead of a secret URL
 
+**Sign-in approved in the app — built 27 Sep 2026** (`SASONICA_SIGNIN=app`;
+David: "let's go app for now", a Sasonica account possibly later as a premium
+route). After Allow the page shows a six-character code and waits; the
+pending sign-in is a row in D1 (`signins`), its count rides every runner
+claim, and the runner raises a `needs` alert (`shell.signin.<runner>`) on
+its machine's alert store so the phone is told. The owner's paired app lists
+them through the agent-media server, which signs the decision with relay.key
+(`signin\n<id>\napprove|deny`) and passes it to the Worker's runner API
+(`signin-decide`, bearer and signature both). The page then completes the
+grant, in its own browser only (the upstream state's cookie), within 10
+minutes, once. No Cloudflare login and no Access setup.
+
 **Status, 27 Sep 2026: the Worker half is built, off until configured.**
 `worker/src/oauth.ts` wraps the MCP endpoint in `workers-oauth-provider`
 with Cloudflare Access (an Access for SaaS OIDC app) as the sign-in: the
