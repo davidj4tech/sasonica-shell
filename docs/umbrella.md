@@ -69,7 +69,7 @@ Tunnel provisioning needs different API permissions than today's two
 Access: Apps and Policies: Edit. Verify with a scoped token the way the
 two-permission floor was verified (`795a406`).
 
-Open question: a user with no Cloudflare account and no domain. Tunnel needs a
+Open question: a user with no Cloudflare account and no domain (proposed answer: a hosted relay, a Durable Object per user — `hosted-relay.md`, 27 Sep 2026). Tunnel needs a
 zone; quick tunnels (`trycloudflare.com`) are unauthenticated and ephemeral, so
 not suitable. Tailscale-only stays a supported mode for that user. David's own
 link lives under sasonica.com, already an active zone in his account.
