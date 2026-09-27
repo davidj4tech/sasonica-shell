@@ -329,14 +329,22 @@ const cases = {
     const consent = await (await b.go(authorizeUrl(clientId), { env })).text();
     assert.match(consent, /approve it in the Sasonica app/);
     const handle = consent.match(/name="handle" value="([^"]+)"/)[1];
-    const waiting = await b.go('/authorize', { env, method: 'POST', body: new URLSearchParams({ handle, decision: 'approve' }), headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+    const posted = await b.go('/authorize', { env, method: 'POST', body: new URLSearchParams({ handle, decision: 'approve' }), headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+    assert.equal(posted.status, 303, 'post/redirect/get: a reload cannot resubmit');
+    const waiting = await b.go(posted.headers.get('location'), { env });
     assert.equal(waiting.status, 200);
     const html = await waiting.text();
+    // A reload of the waiting page is the same page, not a used handle.
+    assert.equal((await b.go(posted.headers.get('location'), { env })).status, 200);
     const code = html.match(/letter-spacing:\.2em">([A-Z0-9]{6})</)[1];
     const id = html.match(/signin\/status\?id=([0-9a-f]{32})/)[1];
     const state = new URLSearchParams(html.match(/\/callback\?([^"]+)"/)[1]).get('state');
     const status = async () => (await (await worker.fetch(new Request(`${ORIGIN}/signin/status?id=${id}`), env, ctx)).json()).status;
     assert.equal(await status(), 'pending');
+    // Going on before an answer does not throw the waiting sign-in away.
+    const early = await browser().go(`/callback?${new URLSearchParams({ state, signin: id })}`, { env });
+    assert.equal(early.status, 400);
+    assert.equal(await status(), 'pending', 'still waiting for the phone');
     assert.equal((await runner({ op: 'claim', fg: 0, bg: 0 })).signins, 1, 'the runner sees one waiting');
     const list = (await runner({ op: 'signins' })).signins;
     assert.deepEqual(list.map((r) => [r.id, r.code, r.client_name, r.client_host]), [[id, code, 'Claude', 'claude.ai']]);
@@ -356,7 +364,7 @@ const cases = {
     const r = await rpc(env, t.body.access_token, 'tools/call', { name: 'run_command', arguments: { command: 'id', wait: 0 } });
     assert.equal(r.status, 200);
     assert.equal(f.row(1).client, 'oauth-claude');
-    assert.equal(await status(), 'expired', 'used once, then gone');
+    assert.equal(await status(), 'waiting', 'used once, then gone (and gone reads as not seen)');
     assert.equal((await runner({ op: 'grants' })).grants[0].label, 'oauth-claude', 'the grant is the owner\'s');
   },
 
@@ -366,7 +374,8 @@ const cases = {
     const b = browser();
     const consent = await (await b.go(authorizeUrl(await register_(env)), { env })).text();
     const handle = consent.match(/name="handle" value="([^"]+)"/)[1];
-    const html = await (await b.go('/authorize', { env, method: 'POST', body: new URLSearchParams({ handle, decision: 'approve' }), headers: { 'content-type': 'application/x-www-form-urlencoded' } })).text();
+    const posted = await b.go('/authorize', { env, method: 'POST', body: new URLSearchParams({ handle, decision: 'approve' }), headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+    const html = await (await b.go(posted.headers.get('location'), { env })).text();
     const id = html.match(/signin\/status\?id=([0-9a-f]{32})/)[1];
     const state = new URLSearchParams(html.match(/\/callback\?([^"]+)"/)[1]).get('state');
     const sig = createHmac('sha256', env.SASONICA_HMAC_KEY).update(`signin\n${id}\ndeny`).digest('hex');
@@ -376,8 +385,9 @@ const cases = {
     const to = new URL(back.headers.get('location'));
     assert.equal(to.searchParams.get('error'), 'access_denied');
     assert.equal(to.searchParams.get('code'), null);
-    // Waiting past the window: an approval that arrives then is refused.
-    assert.equal((await (await worker.fetch(new Request(`${ORIGIN}/signin/status?id=${'0'.repeat(32)}`), env, ctx)).json()).status, 'expired');
+    // A row not (yet) seen is "waiting", never "expired": the page keeps
+    // waiting rather than giving up on a read that raced the insert.
+    assert.equal((await (await worker.fetch(new Request(`${ORIGIN}/signin/status?id=${'0'.repeat(32)}`), env, ctx)).json()).status, 'waiting');
   },
 
   async grantLabels() {

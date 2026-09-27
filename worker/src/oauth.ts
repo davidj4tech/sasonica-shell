@@ -74,7 +74,13 @@ function signinCode(): string {
   return [...b].map((x) => abc[x % abc.length]).join('')
 }
 
-/** The page that waits for the phone: the code, and a poll of /signin/status. */
+/** How long the waiting page waits before giving up by itself, in ms (the window). */
+const WAIT_MS = 10 * 60 * 1000
+
+/** The page that waits for the phone: the code, and a poll of /signin/status.
+ *  It moves on only on an answer (approved, denied) or when the window has
+ *  passed on its own clock: "not found" is not an answer, since a read can
+ *  reach a copy of the database that has not seen the row yet. */
 function waitPage(code: string, id: string, state: string, machine: string, clientName: string): string {
   const next = `/callback?${new URLSearchParams({ state, signin: id })}`
   return `<h1>Approve on your phone</h1>
@@ -82,9 +88,10 @@ function waitPage(code: string, id: string, state: string, machine: string, clie
 <p style="font:600 2rem ui-monospace,monospace;letter-spacing:.2em">${escape(code)}</p>
 <p id="s">Waiting… (this page carries on by itself)</p>
 <script>
-(function(){var t=setInterval(function(){fetch('/signin/status?id=${id}').then(function(r){return r.json()}).then(function(j){
-if(j.status==='approved'){clearInterval(t);location.replace(${JSON.stringify(next)})}
-else if(j.status==='denied'||j.status==='expired'){clearInterval(t);location.replace(${JSON.stringify(next)})}
+(function(){var end=Date.now()+${WAIT_MS};var go=function(){clearInterval(t);location.replace(${JSON.stringify(next)})};
+var t=setInterval(function(){if(Date.now()>end){go();return}
+fetch('/signin/status?id=${id}',{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){
+if(j.status==='approved'||j.status==='denied'||j.status==='expired'){go()}
 }).catch(function(){})},2000)})();
 </script>`
 }
@@ -234,7 +241,10 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
           `INSERT INTO signins (id, code, client_name, client_host, state, status, created_at)
            VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))`,
         ).bind(id, code, name, new URL(approved.request.redirectUri).hostname, state).run()
-        return page('Approve on your phone', waitPage(code, id, state, machineName(url), name), headers)
+        // Post/redirect/get: a reload of the waiting page, or a tab brought
+        // back from the background, must not resubmit the consent form.
+        headers.set('Location', `/signin/wait?id=${id}`)
+        return new Response(null, { status: 303, headers })
       }
       const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)))
       const { state, headers } = await oauth.beginUpstream(approved.request, { data: { verifier }, headers: approved.headers })
@@ -249,6 +259,15 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
       headers.set('Location', to.href)
       return new Response(null, { status: 302, headers })
     }
+    if (url.pathname === '/signin/wait' && request.method === 'GET') {
+      const id = url.searchParams.get('id') || ''
+      const row = /^[0-9a-f]{32}$/.test(id)
+        ? await env.DB.prepare(`SELECT code, client_name, state FROM signins WHERE id = ?`)
+            .bind(id).first<{ code: string; client_name: string; state: string }>()
+        : null
+      if (!row) return page('Sign-in not found', '<p>This sign-in has finished or expired.</p><p>Start connecting again from the app.</p>', undefined, 404)
+      return page('Approve on your phone', waitPage(row.code, id, row.state, machineName(url), row.client_name || 'An assistant'))
+    }
     if (url.pathname === '/signin/status' && request.method === 'GET') {
       // The waiting page's poll. The id is 128 random bits; the answer is only
       // pending / approved / denied / expired, never the code or the client.
@@ -258,7 +277,9 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
             `SELECT status, created_at > datetime('now', ?) AS fresh FROM signins WHERE id = ?`,
           ).bind(SIGNIN_WINDOW, id).first<{ status: string; fresh: number }>()
         : null
-      const status = !row ? 'expired' : row.status === 'pending' && !row.fresh ? 'expired' : row.status
+      // No row is "not yet seen", not "gone": the page keeps waiting, and its
+      // own clock ends the wait.
+      const status = !row ? 'waiting' : row.status === 'pending' && !row.fresh ? 'expired' : row.status
       return Response.json({ status }, { headers: { 'Cache-Control': 'no-store' } })
     }
     if (url.pathname === '/callback' && request.method === 'GET') {
@@ -281,8 +302,10 @@ async function authHandler(request: Request, env: Env & { OAUTH_PROVIDER: Helper
               `SELECT status, state, created_at > datetime('now', ?) AS fresh FROM signins WHERE id = ?`,
             ).bind(SIGNIN_WINDOW, sid).first<{ status: string; state: string; fresh: number }>()
           : null
-        if (row) await env.DB.prepare(`DELETE FROM signins WHERE id = ?`).bind(sid).run()
         if (!row || row.state !== url.searchParams.get('state')) return deny('no such sign-in')
+        // Settled (or past its window): used once, then gone. One still
+        // waiting is left for the phone.
+        if (row.status !== 'pending' || !row.fresh) await env.DB.prepare(`DELETE FROM signins WHERE id = ?`).bind(sid).run()
         if (row.status !== 'approved') return deny(`the phone said ${row.status}`)
         if (!row.fresh) return deny('approved too late')
         const client = await oauth.lookupClient(original.clientId)
