@@ -525,6 +525,21 @@ if (sub === 'tools') {
 // `client`: per-assistant connector URLs. Before the runner-token check on
 // purpose -- it does not use the runner's credential at all, but the
 // Cloudflare token the installer used (lib/clients.mjs says why).
+// A URL as a QR code in the terminal, to get it onto a phone by its camera
+// (then copy the link into the assistant's connector form). qrencode if it is
+// here, else Python's qrcode, else a note. It is a password on screen: the
+// caller asked for it.
+function printQr(text) {
+  const tries = [['qrencode', ['-t', 'ansiutf8', '-m', '1', text]],
+    ['python3', ['-c', 'import sys,qrcode;q=qrcode.QRCode(border=1);q.add_data(sys.argv[1]);q.print_ascii(invert=True)', text]]];
+  for (const [exe, args] of tries) {
+    const r = spawnSync(exe, args, { stdio: ['ignore', 'inherit', 'ignore'] });
+    if (r.status === 0) return true;
+  }
+  console.error('sasonica: no QR drawer here (install qrencode, or pip install qrcode)');
+  return false;
+}
+
 if (sub === 'client') {
   // OAuth grants go through the Worker with the runner's token (revoking
   // only takes access away); everything else here uses the Cloudflare token.
@@ -543,8 +558,10 @@ if (sub === 'client') {
     if (!r.ok || out?.error) throw new Error(`worker: ${out?.error ?? r.status}`);
     return out;
   };
-  process.exit(await clientCommand(rest, {
+  const qr = rest.includes('--qr');
+  process.exit(await clientCommand(rest.filter((a) => a !== '--qr'), {
     cfg, conf: CONF, wordsFile: path.join(path.dirname(SELF), 'words.txt'), runner,
+    ...(qr ? { qr: printQr } : {}),
   }));
 }
 
@@ -554,12 +571,14 @@ if (sub === 'client') {
 // The name labels the rows the URL queues; the secret is the credential, so
 // this prints a password whatever name it carries.
 if (sub === 'url') {
-  const usage = 'usage: sasonica url [--name <n>]    prints the shared connector URL -- a password;\n'
-    + `       name: ${URL_NAME_RE.source.slice(1, -1)} (lowercased)`;
+  const usage = 'usage: sasonica url [--name <n>] [--qr]    prints the shared connector URL -- a password;\n'
+    + `       name: ${URL_NAME_RE.source.slice(1, -1)} (lowercased); --qr draws it as a QR code too`;
   let name = null;
+  let qr = false;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '-h' || a === '--help') { console.log(usage); process.exit(0); }
+    if (a === '--qr') { qr = true; continue; }
     const m = /^--name(?:=(.*))?$/.exec(a);
     if (!m) { console.error(usage); process.exit(2); }
     const raw = m[1] ?? rest[++i];
@@ -573,7 +592,9 @@ if (sub === 'url') {
     console.error(`${ENV_FILE} lacks SASONICA_WORKER_URL or SASONICA_URL_SECRET: run the installer first`);
     process.exit(1);
   }
-  console.log(connectorUrl(cfg.SASONICA_WORKER_URL, cfg.SASONICA_URL_SECRET, name));
+  const shown = connectorUrl(cfg.SASONICA_WORKER_URL, cfg.SASONICA_URL_SECRET, name);
+  console.log(shown);
+  if (qr) printQr(shown);
   process.exit(0);
 }
 
