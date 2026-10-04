@@ -8,6 +8,9 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sasonica-relay",
   "main": "src/hosted.ts",
+  // South Pen Labs (the account sasonica.com's zone is in).
+  "account_id": "d255073199b24b2895921acfb9dd761f",
+  "routes": [{ "pattern": "relay.sasonica.com", "custom_domain": true }],
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["global_fetch_strictly_public"],
   // As on a machine's own Worker: the MCP path IS the credential, so

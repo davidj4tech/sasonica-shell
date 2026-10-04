@@ -1,6 +1,7 @@
 # Proposal: a hosted relay, for people with no Cloudflare account (27 Sep 2026)
 
-Status: **steps 2 and 3 built, not deployed** (4 Oct 2026, David: "let's do
+Status: **steps 2 and 3 built, and live at `https://relay.sasonica.com`**
+(Worker `sasonica-relay`, South Pen Labs account; 4 Oct 2026, David: "let's do
 it" — the hosted relay is next, ahead of any hosted compute). See "Built"
 below. **Decided (David, 27 Sep 2026): self-hosting
 is the free tier and what we build and support now; the hosted relay is a
@@ -140,5 +141,10 @@ beyond what is included, and a user's queue is kilobytes.
 **Not yet:** `sasonica install --hosted` (joining by a Sasonica account
 sign-in instead of the admin token, which needs an OAuth client for the
 relay on cms.sasonica.com); the tenant list per account; OAuth sign-in for
-hosted connectors (the secret URL works today); rate limits; the deploy
-itself (`relay.sasonica.com` on the South Pen Labs account).
+hosted connectors (the secret URL works today); rate limits; deleting a tenant (the live
+test's, `vjky5htb3q34kiut`, is still there with its credentials thrown away).
+
+**Deployed 4 Oct 2026**: `npx wrangler deploy -c wrangler.relay.jsonc` with
+red5's `SPL_CLOUDFLARE_TOKEN`; `RELAY_ADMIN_TOKEN` is in red5's
+`~/.config/sasonica-relay/admin.env`. A throwaway runner on red5 joined a
+tenant made there and ran commands through the connector URL in 0.32 s each.
