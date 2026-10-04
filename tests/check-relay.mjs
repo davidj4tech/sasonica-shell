@@ -16,7 +16,8 @@ import { sign } from './fake-d1.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA = readFileSync(path.join(HERE, '..', 'schema.sql'), 'utf8');
-const { TenantCore, relayFetch } = await import('../worker/src/tenant.ts');
+const { TenantCore, relayFetch, accountAllowed } = await import('../worker/src/tenant.ts');
+const { JoinCore, JOIN_TTL_MS } = await import('../worker/src/join.ts');
 const { resetClientCache } = await import('../worker/src/index.ts');
 const ADMIN = 'admin-token-under-test';
 
@@ -61,10 +62,55 @@ function fakeRelay() {
       return objects.get(name);
     },
   };
-  const env = { TENANTS, RELAY_ADMIN_TOKEN: ADMIN };
+  // The issuer, as far as a join sees it: the token endpoint and userinfo.
+  const issuer = { sub: '1', calls: [] };
+  const fetcher = async (u, init = {}) => {
+    issuer.calls.push({ url: String(u), body: init.body ? String(init.body) : '' });
+    if (String(u).endsWith('/oauth/token')) {
+      return new URLSearchParams(String(init.body)).get('code') === 'good-code'
+        ? Response.json({ access_token: 'at', token_type: 'Bearer' })
+        : Response.json({ error: 'invalid_grant' }, { status: 400 });
+    }
+    if (String(u).endsWith('/oauth/userinfo')) return Response.json({ sub: issuer.sub, preferred_username: 'david' });
+    return new Response('?', { status: 404 });
+  };
+  const clock = { now: Date.now() };
+  const joins = new Map();
+  const JOINS = {
+    idFromName: (name) => name,
+    get(name) {
+      if (!joins.has(name)) {
+        const core = new JoinCore(fakeStorage(), () => clock.now);
+        joins.set(name, {
+          core,
+          start: (...a) => core.start(...a),
+          authorizeUrl: (...a) => core.authorizeUrl(...a),
+          callback: (code, origin, list) => core.callback(code, origin, (acct) => accountAllowed(list, acct), fetcher),
+          confirm: async (n) => core.confirm(n),
+          deliver: async (c) => core.deliver(c),
+          collect: (p) => core.collect(p),
+        });
+      }
+      return joins.get(name);
+    },
+  };
+  const env = { TENANTS, JOINS, RELAY_ADMIN_TOKEN: ADMIN, RELAY_ALLOW_ACCOUNTS: 'https://cms.sasonica.com|1' };
   const go = (p, init = {}) => relayFetch(new Request(`https://relay.example${p}`, init), env);
-  return { env, objects, rings, go };
+  return { env, objects, rings, go, issuer, clock };
 }
+
+// A join up to its confirm page: start, the redirect, the callback.
+async function joinToConfirm(relay, machine = 'desk') {
+  const started = await (await relay.go('/join/start', { method: 'POST', body: JSON.stringify({ machine }) })).json();
+  const to = await relay.go(`/join/${started.id}`);
+  const callback = await relay.go(`/join/callback?code=good-code&state=${started.id}`);
+  const html = await callback.text();
+  const nonce = /name="confirm" value="([0-9a-f]+)"/.exec(html)?.[1];
+  return { started, to, callback, html, nonce };
+}
+const confirmJoin = (relay, id, nonce) => relay.go(`/join/${id}/confirm`, {
+  method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `confirm=${nonce}` });
+const pollJoin = (relay, id, poll) => relay.go(`/join/${id}/poll`, { method: 'POST', body: JSON.stringify({ poll }) });
 
 async function makeTenant(relay, account = 'https://cms.sasonica.com|1') {
   const r = await relay.go('/tenants', {
@@ -183,6 +229,107 @@ const cases = {
     const gb = await (await mcp(relay, b, 'tools/call', { name: 'get_result', arguments: { id: 1 } })).json();
     assert.equal(gb.result.content[0].text, 'No command #1.');
     assert.equal(relay.rings.get(b.tenant), 0);
+  },
+
+  // --- joining with a Sasonica account (worker/src/join.ts) ------------------
+
+  async aJoinSignsInConfirmsAndHandsOverOnce() {
+    const relay = fakeRelay();
+    const { started, to, callback, html, nonce } = await joinToConfirm(relay, 'desk');
+    assert.match(started.code, /^[A-HJ-NP-Z2-9]{6}$/);
+    assert.equal(started.url, `https://relay.example/join/${started.id}`);
+    // Off to the issuer, with PKCE and the join as the state.
+    assert.equal(to.status, 302);
+    const auth = new URL(to.headers.get('location'));
+    assert.equal(auth.origin + auth.pathname, 'https://cms.sasonica.com/oauth/authorize');
+    assert.equal(auth.searchParams.get('client_id'), 'sasonica-relay');
+    assert.equal(auth.searchParams.get('state'), started.id);
+    assert.equal(auth.searchParams.get('code_challenge_method'), 'S256');
+    assert.equal(auth.searchParams.get('redirect_uri'), 'https://relay.example/join/callback');
+    // The token request carried the verifier behind that challenge.
+    const verifier = new URLSearchParams(relay.issuer.calls[0].body).get('code_verifier');
+    const digest = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))).toString('base64url');
+    assert.equal(digest, auth.searchParams.get('code_challenge'));
+    // The confirm page names the machine and the code, and makes nothing yet.
+    assert.equal(callback.status, 200);
+    assert.ok(html.includes(started.code) && html.includes('desk') && html.includes('david'));
+    assert.equal((await (await pollJoin(relay, started.id, started.poll)).json()).status, 'signed-in');
+    assert.equal(relay.objects.size, 0);
+    const joined = await confirmJoin(relay, started.id, nonce);
+    assert.equal(joined.status, 200);
+    const creds = await (await pollJoin(relay, started.id, started.poll)).json();
+    assert.match(creds.SASONICA_WORKER_URL, /^https:\/\/relay\.example\/t\/[a-z2-7]{16}$/);
+    // The credentials work, and went out once.
+    assert.equal((await runner(relay, creds, { op: 'claim', fg: 1 })).status, 200);
+    assert.equal((await pollJoin(relay, started.id, started.poll)).status, 404);
+    // The tenant belongs to the account that signed in.
+    const meta = relay.objects.get(creds.tenant).storage.db.prepare(`SELECT value FROM tenant_meta WHERE key = 'account'`).get();
+    assert.equal(meta.value, 'https://cms.sasonica.com|1');
+  },
+
+  async aJoinNeedsItsPollSecretAndItsConfirm() {
+    const relay = fakeRelay();
+    const { started, nonce } = await joinToConfirm(relay);
+    assert.equal((await pollJoin(relay, started.id, 'f'.repeat(64))).status, 404);
+    assert.equal((await confirmJoin(relay, started.id, '0'.repeat(32))).status, 404);
+    assert.equal(relay.objects.size, 0);
+    assert.equal((await confirmJoin(relay, started.id, nonce)).status, 200);
+    // A second press makes no second tenant.
+    assert.equal((await confirmJoin(relay, started.id, nonce)).status, 404);
+    assert.equal(relay.objects.size, 1);
+  },
+
+  async anAccountOffTheListCannotJoin() {
+    const relay = fakeRelay();
+    relay.issuer.sub = '2';
+    const { callback, nonce } = await joinToConfirm(relay);
+    assert.equal(callback.status, 403);
+    assert.equal(nonce, undefined);
+    assert.equal(relay.objects.size, 0);
+    assert.equal(accountAllowed('*', 'x|2'), true);
+    assert.equal(accountAllowed('', 'https://cms.sasonica.com|1'), false);
+  },
+
+  async aBadCodeOrAnOldJoinGoesNowhere() {
+    const relay = fakeRelay();
+    const s = await (await relay.go('/join/start', { method: 'POST', body: '{}' })).json();
+    const bad = await relay.go(`/join/callback?code=bad-code&state=${s.id}`);
+    assert.equal(bad.status, 403);
+    relay.clock.now += JOIN_TTL_MS + 1000;
+    assert.equal((await relay.go(`/join/${s.id}`)).status, 404);
+    assert.equal((await pollJoin(relay, s.id, s.poll)).status, 404);
+  },
+
+  async theInstallersJoinCollectsOnceJoinIsPressed() {
+    const { joinRelay } = await import('../lib/hosted-join.mjs');
+    const relay = fakeRelay();
+    const fetcher = (u, init) => relayFetch(new Request(u, init), relay.env);
+    let shown = null;
+    const joined = joinRelay({ relay: 'https://relay.example/', machine: 'desk', fetcher, every: 20,
+      show: (url, code) => { shown = { url, code }; } });
+    while (!shown) await new Promise((r) => setTimeout(r, 5));
+    // The person: open the link, sign in, press Join.
+    const id = shown.url.split('/').pop();
+    await relay.go(`/join/${id}`);
+    const html = await (await relay.go(`/join/callback?code=good-code&state=${id}`)).text();
+    assert.ok(html.includes(shown.code));
+    await confirmJoin(relay, id, /name="confirm" value="([0-9a-f]+)"/.exec(html)[1]);
+    const creds = await joined;
+    assert.equal((await runner(relay, creds, { op: 'claim', fg: 1 })).status, 200);
+    // Refused: the installer stops with the reason rather than waiting out 15 minutes.
+    relay.issuer.sub = '9';
+    let shown2 = null;
+    const refused = joinRelay({ relay: 'https://relay.example', machine: 'desk', fetcher, every: 20,
+      show: (url) => { shown2 = url; } });
+    while (!shown2) await new Promise((r) => setTimeout(r, 5));
+    await relay.go(`/join/callback?code=good-code&state=${shown2.split('/').pop()}`);
+    await assert.rejects(refused, /join ended without this machine/);
+  },
+
+  async aMachineNameCannotWriteThePage() {
+    const relay = fakeRelay();
+    const { html } = await joinToConfirm(relay, '<img src=x onerror=alert(1)>');
+    assert.ok(!html.includes('<img'));
   },
 };
 

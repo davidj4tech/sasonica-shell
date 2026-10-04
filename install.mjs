@@ -7,6 +7,9 @@
 //   node install.mjs                 interactive: asks for the token if not in env
 //   node install.mjs --no-service    everything except registering the runner
 //   node install.mjs --print-url     print this machine's connector URL and exit
+//   node install.mjs --hosted        no Cloudflare account: join South Pen Labs'
+//                                    hosted relay by signing in with a Sasonica
+//                                    account (SASONICA_RELAY_URL to use another)
 //
 // The ONE manual step is the token. Create it at
 //   https://dash.cloudflare.com/profile/api-tokens  ->  Create Token  ->  Custom
@@ -25,6 +28,7 @@ import { homedir, hostname, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { cfRequest } from './lib/cloudflare.mjs';
+import { DEFAULT_RELAY, joinRelay, openBrowser } from './lib/hosted-join.mjs';
 import { hex, siteName, urlSecret, readEnvFile, renderEnv, renderShim, connectorUrl,
          winShellCommand, needsWindowsShell, OAUTH_KV_MARKER, oauthKvLine, ownerPolicyBody,
          accessAppBody } from './lib/install-lib.mjs';
@@ -40,6 +44,7 @@ const die = (m) => { console.error(`\n${WIN ? '' : '\x1b[31m'}ERROR:${WIN ? '' :
 const args = new Set(process.argv.slice(2));
 const NO_SERVICE = args.has('--no-service');
 const PRINT_URL = args.has('--print-url');
+let HOSTED = args.has('--hosted');
 
 // --- config files ------------------------------------------------------------
 // Windows has no XDG; %APPDATA% is where per-user config belongs there.
@@ -139,6 +144,9 @@ for (const [k, v] of Object.entries(readEnvFile(path.join(HERE, 'install.conf'))
   if (!process.env[k]) process.env[k] = v;
 }
 
+// A machine that joined the hosted relay stays hosted on a re-run.
+if (existing.SASONICA_HOSTED === '1') HOSTED = true;
+
 const site = siteName(process.env.SASONICA_SITE || hostname().split('.')[0]);
 // A re-run must find the stack it made, even if the machine was renamed.
 const workerName = process.env.SASONICA_WORKER_NAME || existing.SASONICA_WORKER_NAME || `sasonica-shell-${site}`;
@@ -161,6 +169,54 @@ if (ownerEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(ownerEmail)) {
   process.exit(1);
 }
 
+// Either the machine's own Worker in the person's Cloudflare account
+// (provision, steps 1-6), or a tenant on the hosted relay (joinHosted).
+// Everything after -- the env file, the command, the smoke test, the
+// service -- is the same for both.
+let accountId = '', dbId = '';
+let secret, runnerToken, workerUrl;
+if (HOSTED) ({ secret, runnerToken, workerUrl } = await joinHosted());
+else ({ accountId, dbId, secret, runnerToken, workerUrl } = await provision());
+
+async function joinHosted() {
+  const relay = (process.env.SASONICA_RELAY_URL || existing.SASONICA_RELAY_URL || DEFAULT_RELAY).replace(/\/+$/, '');
+  mkdirSync(CONF, { recursive: true });
+  if (!WIN) chmodSync(CONF, 0o700);
+  const keyHere = existsSync(KEY_FILE) && readFileSync(KEY_FILE, 'utf8').trim();
+  if (existing.SASONICA_HOSTED === '1' && existing.SASONICA_WORKER_URL && existing.SASONICA_RUNNER_TOKEN
+      && existing.SASONICA_URL_SECRET && keyHere) {
+    say(`Hosted relay: already joined (${existing.SASONICA_WORKER_URL}), keeping it`);
+    return { secret: existing.SASONICA_URL_SECRET, runnerToken: existing.SASONICA_RUNNER_TOKEN,
+             workerUrl: existing.SASONICA_WORKER_URL };
+  }
+  say(`Joining the hosted relay at ${relay} with your Sasonica account`);
+  let creds;
+  try {
+    creds = await joinRelay({
+      relay, machine: site,
+      show: (url, code) => {
+        console.log(`
+    Open this link, sign in with your Sasonica account, and press Join:
+
+        ${url}
+
+    The page will show this code; only press Join if it matches:
+
+        ${code}
+`);
+        openBrowser(url);
+        note('waiting for Join…');
+      },
+    });
+  } catch (e) { die(e.message); }
+  // relay.key is the tenant's: the relay signs each row with it, as a
+  // machine's own Worker does with SASONICA_HMAC_KEY.
+  writeText(KEY_FILE, `${creds.hmac_key}\n`, 0o600);
+  note(`joined as tenant ${creds.tenant}`);
+  return { secret: creds.SASONICA_URL_SECRET, runnerToken: creds.SASONICA_RUNNER_TOKEN, workerUrl: creds.SASONICA_WORKER_URL };
+}
+
+async function provision() {
 // --- 1. dependencies -----------------------------------------------------------
 say('Checking dependencies');
 note(`node ${process.version}, npm ${run(NPM, ['-v'], { capture: true }).out.trim()}`);
@@ -387,6 +443,8 @@ if (signin === 'app') {
 const deploy = wrangler(['deploy'], { capture: true });
 if (deploy.code !== 0) { console.error(deploy.err || deploy.out); die('wrangler deploy failed'); }
 for (const line of `${deploy.out}${deploy.err}`.trim().split('\n').slice(-3)) note(line.trim());
+return { accountId, dbId, secret, runnerToken, workerUrl };
+}
 
 // --- 7. local config ------------------------------------------------------------------
 say(`Writing ${ENV_FILE}`);
@@ -395,6 +453,7 @@ say(`Writing ${ENV_FILE}`);
 // machine would reach every other machine's queue.
 writeText(ENV_FILE, renderEnv({
   accountId, site, workerName, dbName, dbId, secret, workerUrl, runnerToken, keyFile: KEY_FILE, ownerEmail, signin: signin === 'app' ? 'app' : '',
+  hosted: HOSTED ? (process.env.SASONICA_RELAY_URL || existing.SASONICA_RELAY_URL || DEFAULT_RELAY) : '',
 }), 0o600);
 mkdirSync(path.join(CONF, 'skills'), { recursive: true });
 

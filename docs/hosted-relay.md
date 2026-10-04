@@ -138,9 +138,20 @@ beyond what is included, and a user's queue is kilobytes.
   `SASONICA_URL_SECRET`, the key for `relay.key`, and the connector URL —
   shown once.
 
-**Not yet:** `sasonica install --hosted` (joining by a Sasonica account
-sign-in instead of the admin token, which needs an OAuth client for the
-relay on cms.sasonica.com); the tenant list per account; OAuth sign-in for
+**Joining with a Sasonica account (built 4 Oct 2026, `worker/src/join.ts`,
+`lib/hosted-join.mjs`):** `sasonica install --hosted` starts a join, prints a
+link and a six-character code, and waits. The link signs the person in at
+cms.sasonica.com (the public PKCE client `sasonica-relay`, made by websites
+`drush/accounts-setup.php`); the relay asks userinfo who it was, checks
+`RELAY_ALLOW_ACCOUNTS` (`<issuer>|<sub>`, or `*`; David's account only for
+now), and shows a page naming the machine and the code with a **Join**
+button. The button, not the sign-in, makes the tenant — so a join link sent
+to someone else cannot quietly add a stranger's machine to their account.
+The installer collects the credentials once and writes the env file
+(`SASONICA_HOSTED=1`, `SASONICA_RELAY_URL`) and `relay.key`; a join expires
+after 15 minutes. One Durable Object per join (`Join`), wiped by an alarm.
+
+**Not yet:** the tenant list per account (and removing a machine); OAuth sign-in for
 hosted connectors (the secret URL works today); rate limits; deleting a tenant (the live
 test's, `vjky5htb3q34kiut`, is still there with its credentials thrown away).
 

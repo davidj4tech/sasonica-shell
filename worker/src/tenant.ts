@@ -18,6 +18,7 @@
  */
 
 import { randomHex, secretFetch, sha256Hex, timingSafeEqual, type Env } from './index.ts'
+import { cleanMachine, confirmPage, joinCode, page, type Creds } from './join.ts'
 
 // --- a D1 binding over a Durable Object's SQLite ------------------------------
 
@@ -173,11 +174,32 @@ export interface TenantStub {
   fetch(request: Request): Promise<Response>
   init(t: TenantInit): Promise<{ ok: true } | { error: string }>
 }
+export interface JoinStub {
+  start(pollSha256: string, machine: string, code: string): Promise<{ ok: true } | { error: string }>
+  authorizeUrl(id: string, origin: string): Promise<string | null>
+  callback(code: string, origin: string, allowList: string): Promise<
+    { machine: string; code: string; confirm: string; who: string } | { error: string }>
+  confirm(nonce: string): Promise<{ account: string; machine: string } | { error: string }>
+  deliver(creds: Creds): Promise<void>
+  collect(poll: string): Promise<{ status: string } | { creds: Creds } | null>
+}
 export interface RelayEnv {
   TENANTS: { idFromName(name: string): unknown; get(id: any): TenantStub }
-  /** Bearer token for POST /tenants until joining goes through a Sasonica
-   *  account. Absent = nobody can make a tenant. */
+  JOINS: { idFromName(name: string): unknown; get(id: any): JoinStub }
+  /** Bearer token for POST /tenants (made by hand, no sign-in). Absent =
+   *  only joining makes tenants. */
   RELAY_ADMIN_TOKEN?: string
+  /**
+   * Who may join, comma-separated `<issuer>|<sub>` (as agent-media's
+   * MEDIA_OIDC_ALLOW), or `*` for any Sasonica account. Absent = nobody.
+   */
+  RELAY_ALLOW_ACCOUNTS?: string
+}
+
+/** Whether an account (`<issuer>|<sub>`) is on the allow list. */
+export function accountAllowed(list: string | undefined, account: string): boolean {
+  const items = String(list ?? '').split(',').map((s) => s.trim()).filter(Boolean)
+  return items.includes('*') || items.includes(account)
 }
 
 /** 16 characters of base32 (80 bits): the tenant's part of its URLs. */
@@ -200,6 +222,7 @@ export async function relayFetch(request: Request, env: RelayEnv): Promise<Respo
   const url = new URL(request.url)
   const parts = url.pathname.split('/').filter(Boolean)
   if (parts.length === 1 && parts[0] === 'tenants') return createTenant(request, env, url)
+  if (parts[0] === 'join') return joinFetch(request, env, url, parts)
   if (parts[0] !== 't' || !TENANT_RE.test(parts[1] ?? '')) return notFound()
   const inner = new URL(`/${parts.slice(2).join('/')}${url.search}`, url.origin)
   const stub = env.TENANTS.get(env.TENANTS.idFromName(parts[1]))
@@ -219,6 +242,13 @@ async function createTenant(request: Request, env: RelayEnv, url: URL): Promise<
   try { body = await request.json() } catch { body = {} }
   const account = String(body?.account ?? '').slice(0, 200)
   if (!account) return Response.json({ error: 'account is required' }, { status: 400 })
+  const made = await makeTenant(env, url.origin, account)
+  if ('error' in made) return Response.json(made, { status: 409 })
+  return Response.json({ account, ...made })
+}
+
+/** A new tenant for `account`, and the secrets its machine needs. */
+async function makeTenant(env: RelayEnv, origin: string, account: string): Promise<Creds | { error: string }> {
   const tenant = tenantId()
   const hmacKey = randomHex(32)
   const runnerToken = randomHex(32)
@@ -229,10 +259,10 @@ async function createTenant(request: Request, env: RelayEnv, url: URL): Promise<
     runnerTokenSha256: await sha256Hex(runnerToken),
     urlSecretSha256: await sha256Hex(urlSecret),
   })
-  if ('error' in made) return Response.json(made, { status: 409 })
-  const workerUrl = `${url.origin}/t/${tenant}`
-  return Response.json({
-    tenant, account,
+  if ('error' in made) return made
+  const workerUrl = `${origin}/t/${tenant}`
+  return {
+    tenant,
     // What the machine's env file takes, as the self-hosted installer
     // writes it, plus the key for relay.key.
     SASONICA_WORKER_URL: workerUrl,
@@ -240,5 +270,64 @@ async function createTenant(request: Request, env: RelayEnv, url: URL): Promise<
     SASONICA_URL_SECRET: urlSecret,
     hmac_key: hmacKey,
     connector_url: `${workerUrl}/${urlSecret}/mcp`,
-  })
+  }
+}
+
+// --- joining (./join.ts) ------------------------------------------------------------
+
+const JOIN_ID = /^[0-9a-f]{32}$/
+const expired = () => page('This join has expired', '<p>Run the installer again on your machine.</p>', 404)
+
+/**
+ *   POST /join/start {machine}       -> {id, code, poll, url}   (the installer)
+ *   GET  /join/<id>                  -> 302 to sign in at cms.sasonica.com
+ *   GET  /join/callback?code&state   -> the confirm page
+ *   POST /join/<id>/confirm          -> the tenant is made; "back to your terminal"
+ *   POST /join/<id>/poll {poll}      -> 202 {status} until joined, then the credentials, once
+ */
+async function joinFetch(request: Request, env: RelayEnv, url: URL, parts: string[]): Promise<Response> {
+  const stubFor = (id: string) => env.JOINS.get(env.JOINS.idFromName(id))
+  if (parts.length === 2 && parts[1] === 'start' && request.method === 'POST') {
+    let body: any
+    try { body = await request.json() } catch { body = {} }
+    const id = randomHex(16)
+    const poll = randomHex(32)
+    const code = joinCode()
+    const made = await stubFor(id).start(await sha256Hex(poll), cleanMachine(body?.machine), code)
+    if ('error' in made) return Response.json(made, { status: 409 })
+    return Response.json({ id, code, poll, url: `${url.origin}/join/${id}` })
+  }
+  if (parts.length === 2 && parts[1] === 'callback' && request.method === 'GET') {
+    const id = url.searchParams.get('state') ?? ''
+    if (!JOIN_ID.test(id)) return expired()
+    if (url.searchParams.get('error')) return page('Sign-in cancelled', '<p>Nothing was added. Run the installer again to retry.</p>')
+    const got = await stubFor(id).callback(url.searchParams.get('code') ?? '', url.origin, env.RELAY_ALLOW_ACCOUNTS ?? '')
+    if ('error' in got) return page('Not joined', `<p>${got.error.replace(/[&<>]/g, '')}</p>`, 403)
+    return confirmPage(id, got)
+  }
+  const id = parts[1] ?? ''
+  if (!JOIN_ID.test(id)) return new Response('not found', { status: 404 })
+  if (parts.length === 2 && request.method === 'GET') {
+    const to = await stubFor(id).authorizeUrl(id, url.origin)
+    return to ? Response.redirect(to, 302) : expired()
+  }
+  if (parts.length === 3 && parts[2] === 'confirm' && request.method === 'POST') {
+    const form = await request.formData().catch(() => null)
+    const stub = stubFor(id)
+    const ok = await stub.confirm(String(form?.get('confirm') ?? ''))
+    if ('error' in ok) return expired()
+    const creds = await makeTenant(env, url.origin, ok.account)
+    if ('error' in creds) return page('Not joined', '<p>Something went wrong. Run the installer again.</p>', 500)
+    await stub.deliver(creds)
+    return page('Joined', `<p><b>${ok.machine.replace(/[&<>]/g, '')}</b> is joining your relay. Go back to its terminal: the installer finishes from here.</p>`)
+  }
+  if (parts.length === 3 && parts[2] === 'poll' && request.method === 'POST') {
+    let body: any
+    try { body = await request.json() } catch { body = {} }
+    const got = await stubFor(id).collect(String(body?.poll ?? ''))
+    if (!got) return new Response('not found', { status: 404 })
+    if ('creds' in got) return Response.json(got.creds)
+    return Response.json(got, { status: 202 })
+  }
+  return new Response('not found', { status: 404 })
 }

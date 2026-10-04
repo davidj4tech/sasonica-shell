@@ -16,8 +16,17 @@
   // As on a machine's own Worker: the MCP path IS the credential, so
   // invocation logs (which record URLs) stay off.
   "observability": { "enabled": true, "logs": { "invocation_logs": false } },
-  "durable_objects": { "bindings": [{ "name": "TENANTS", "class_name": "Tenant" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Tenant"] }],
+  "durable_objects": { "bindings": [
+    { "name": "TENANTS", "class_name": "Tenant" },
+    { "name": "JOINS", "class_name": "Join" }
+  ] },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Tenant"] },
+    { "tag": "v2", "new_sqlite_classes": ["Join"] }
+  ],
+  // Who may join with a Sasonica account (src/tenant.ts accountAllowed):
+  // `<issuer>|<sub>`, comma-separated, or `*`. David's account, for now.
+  "vars": { "RELAY_ALLOW_ACCOUNTS": "https://cms.sasonica.com|1" },
   // schema.sql is imported as text: the same schema a machine's D1 gets.
   "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }]
 }
