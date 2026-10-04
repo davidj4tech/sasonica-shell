@@ -59,3 +59,16 @@ jobs:
         # Windows PowerShell 5.1, which is what ships on the machine, not pwsh 7.
         shell: powershell
         run: .\tests\check-windows-install.ps1
+      - name: The one-line download (get.ps1, as irm | iex runs it)
+        shell: powershell
+        run: |
+          $env:SASONICA_GET_ONLY = '1'
+          $env:SASONICA_GET_ZIP = "https://github.com/${{ github.repository }}/archive/${{ github.sha }}.zip"
+          Get-Content -Raw .\get.ps1 | Invoke-Expression
+          $dest = Join-Path $env:LOCALAPPDATA 'sasonica\shell'
+          if (-not (Test-Path (Join-Path $dest 'install.mjs'))) { throw 'install.mjs was not unpacked' }
+          # Again, as an update: the tree is replaced and a kept file survives.
+          Set-Content -Path (Join-Path $dest 'install.conf') -Value 'SASONICA_SITE=ci'
+          Get-Content -Raw .\get.ps1 | Invoke-Expression
+          if ((Get-Content -Raw (Join-Path $dest 'install.conf')).Trim() -ne 'SASONICA_SITE=ci') { throw 'install.conf was not kept' }
+          Write-Host 'get.ps1: unpacked, updated, kept install.conf'

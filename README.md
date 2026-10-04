@@ -127,7 +127,7 @@ The short version for an existing Cloudflare user:
 
    On macOS, install [Homebrew](https://brew.sh) first; the same `./install.sh` sets up dependencies and a login LaunchAgent.
 
-   On Windows, run `.\install.ps1` from PowerShell. It is a native installer: no WSL2, no Ubuntu. The runner there is the same `sasonica.mjs` under Node, started by a Scheduled Task at logon.
+   On Windows, run `.\install.ps1` from PowerShell. It is a native installer: no WSL2, no Ubuntu. The runner there is the same `sasonica.mjs` under Node, started by a Scheduled Task at logon. With no clone at all, `irm https://sasonica.com/install.ps1 | iex` downloads this repository (`get.ps1`) and joins the hosted relay with a Sasonica account — no Cloudflare account needed (`install.ps1 -Hosted`, or `--hosted` to `install.sh`/`install.mjs`, does the same from a clone).
 3. Add the printed `https://.../<secret>/mcp` URL to your MCP client as a remote/custom connector with no additional authentication.
 
 The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows). The runner is the same `sasonica.mjs` on all three.
