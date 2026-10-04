@@ -5,6 +5,7 @@
       Set-ExecutionPolicy -Scope Process Bypass; .\install.ps1
       .\install.ps1 -NoService      # everything except registering the runner
       .\install.ps1 -PrintUrl       # print this machine's connector URL and exit
+      .\install.ps1 -Hosted         # no Cloudflare account: join the hosted relay
 
   Everything this script used to do itself is in install.mjs now, shared with
   Linux and macOS. What is left is the one thing that cannot be written in
@@ -17,6 +18,7 @@
 param(
   [switch]$NoService,
   [switch]$PrintUrl,
+  [switch]$Hosted,
   [switch]$Lib
 )
 
@@ -53,5 +55,6 @@ $NodeExe = Install-NodeIfMissing
 $argv = @()
 if ($NoService) { $argv += '--no-service' }
 if ($PrintUrl)  { $argv += '--print-url' }
+if ($Hosted)    { $argv += '--hosted' }
 & $NodeExe (Join-Path $Here 'install.mjs') @argv
 exit $LASTEXITCODE
