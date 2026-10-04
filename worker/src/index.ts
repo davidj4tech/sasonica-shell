@@ -47,6 +47,19 @@ export interface Env extends OAuthEnv {
   /** Seconds run_command waits by default / at most. */
   SASONICA_WAIT_DEFAULT?: string
   SASONICA_WAIT_MAX?: string
+  /**
+   * The hosted relay only (./tenant.ts): which tenant this env serves, so
+   * per-isolate caches never answer one tenant with another's rows -- an
+   * isolate can hold many tenants' Durable Objects at once.
+   */
+  SASONICA_TENANT?: string
+  /**
+   * The hosted relay only: called the moment a row is queued, to ring the
+   * runner's doorbell (a held WebSocket). With it set, a claim is never held
+   * open: a held request is billed for every second it waits, a hibernating
+   * socket is not.
+   */
+  onQueued?: () => void
 }
 
 const PROTOCOL_VERSION = '2025-06-18'
@@ -102,7 +115,7 @@ export function timingSafeEqual(a: string, b: string): boolean {
 //           so a person reading the rows can tell who did what on a URL
 //           several assistants share, not to decide anything.
 
-async function sha256Hex(text: string): Promise<string> {
+export async function sha256Hex(text: string): Promise<string> {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
@@ -121,7 +134,10 @@ export function resetClientCache(): void {
 
 async function lookupClient(env: Env, hash: string): Promise<ClientLookup> {
   const now = Date.now()
-  const cached = clientCache.get(hash)
+  // Keyed by tenant too: on the hosted relay one isolate serves many
+  // tenants, and a bare hash would let one tenant's secret open another's.
+  const key = `${env.SASONICA_TENANT ?? ''}:${hash}`
+  const cached = clientCache.get(key)
   if (cached && now - cached.at < CLIENT_CACHE_MS) return cached.hit
   let hit: ClientLookup = null
   try {
@@ -136,7 +152,7 @@ async function lookupClient(env: Env, hash: string): Promise<ClientLookup> {
     return null
   }
   if (clientCache.size >= 256) clientCache.clear()
-  clientCache.set(hash, { at: now, hit })
+  clientCache.set(key, { at: now, hit })
   return hit
 }
 
@@ -665,13 +681,15 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
       // Sign-ins waiting for the owner (SASONICA_SIGNIN=app): the count rides
       // every claim, so the runner asks for the list only when it moves.
       let signins = await pendingSignins(env)
-      if (!fg && !bg) return runnerJson({ rows: [], signins })
+      if (!fg && !bg) return runnerJson({ rows: [], signins, ...(env.onQueued ? { doorbell: true } : {}) })
       // Long wait (an idle runner asks with `wait`): held open until a row
       // arrives, the sign-ins move, or the wait is up, checking once a second
       // with a cheap read. An idle machine then costs one request per wait
       // instead of one per poll — what lets a free account hold ~30 of them —
       // and a command still starts within about a second (27 Sep 2026).
-      const wait = Math.min(Math.max(Number(body?.wait) || 0, 0), LONG_WAIT_MAX)
+      // With a doorbell (the hosted relay) the runner waits on its socket
+      // instead, and a claim is answered at once.
+      const wait = env.onQueued ? 0 : Math.min(Math.max(Number(body?.wait) || 0, 0), LONG_WAIT_MAX)
       if (wait) {
         const seen = Number(body?.signins_seen ?? signins)
         const deadline = Date.now() + wait * 1000
@@ -694,7 +712,7 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
          RETURNING id, command, sig, nonce, COALESCE(background, 0) AS background,
                    COALESCE(kind, 'shell') AS kind`,
       ).bind(runner, fg, bg).all()
-      return runnerJson({ rows: results, signins, ...(wait ? { waited: wait } : {}) })
+      return runnerJson({ rows: results, signins, ...(wait ? { waited: wait } : {}), ...(env.onQueued ? { doorbell: true } : {}) })
     }
     // Sign-ins approved in the app (§6): the waiting ones, and a decision.
     // The decision is signed with SASONICA_HMAC_KEY as well as carried by
@@ -864,6 +882,7 @@ async function enqueue(env: Env, command: string, waitSeconds: number, backgroun
     .bind(command, sig, nonce, background ? 1 : 0, who.client, who.name, who.agent, kind)
     .run()
   const id = Number(ins.meta.last_row_id)
+  env.onQueued?.()
   const r = await awaitRow(env, id, waitSeconds)
   return { row: r.row ?? { id, status: 'pending', exit_code: null, output: null }, timedOut: r.timedOut }
 }

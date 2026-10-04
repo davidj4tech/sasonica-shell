@@ -1,0 +1,20 @@
+// Sasonica Shell — the HOSTED relay (docs/hosted-relay.md), run by South Pen
+// Labs: one Worker, a Durable Object per tenant. Not what `sasonica install`
+// deploys; that is wrangler.jsonc.template, one Worker per machine.
+//
+//     npx wrangler deploy -c wrangler.relay.jsonc
+//     npx wrangler secret put RELAY_ADMIN_TOKEN -c wrangler.relay.jsonc
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sasonica-relay",
+  "main": "src/hosted.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  // As on a machine's own Worker: the MCP path IS the credential, so
+  // invocation logs (which record URLs) stay off.
+  "observability": { "enabled": true, "logs": { "invocation_logs": false } },
+  "durable_objects": { "bindings": [{ "name": "TENANTS", "class_name": "Tenant" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Tenant"] }],
+  // schema.sql is imported as text: the same schema a machine's D1 gets.
+  "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }]
+}

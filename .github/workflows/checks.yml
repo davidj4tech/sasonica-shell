@@ -31,6 +31,8 @@ jobs:
         run: node tests/check-install.mjs
       - name: Worker runner API
         run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-worker.mjs
+      - name: Hosted relay (tenants kept apart)
+        run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-relay.mjs
       - name: Worker OAuth
         run: |
           npm ci --prefix worker --no-audit --no-fund

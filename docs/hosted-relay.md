@@ -1,6 +1,8 @@
 # Proposal: a hosted relay, for people with no Cloudflare account (27 Sep 2026)
 
-Status: proposed, not built. **Decided (David, 27 Sep 2026): self-hosting
+Status: **steps 2 and 3 built, not deployed** (4 Oct 2026, David: "let's do
+it" — the hosted relay is next, ahead of any hosted compute). See "Built"
+below. **Decided (David, 27 Sep 2026): self-hosting
 is the free tier and what we build and support now; the hosted relay is a
 later middle tier (a small fee against its $5/month running cost), with a
 Sasonica account's premium features above it.** Answers `umbrella.md`'s open question, "a user
@@ -26,9 +28,13 @@ account.
   queue.** A leak, a bug or a bad command in one user's relay must not reach
   another user's machine. This is why `umbrella.md` keeps one Worker per
   machine rather than one Worker fronting many.
-- **The relay cannot make a machine run anything.** Rows are signed with the
-  machine's relay key, which the relay never holds for signing on its own
-  behalf; the runner refuses anything unsigned. That stays true hosted.
+- **Rows are signed with the tenant's key, and the runner refuses anything
+  unsigned.** Corrected 4 Oct 2026: the relay *does* hold that key — a
+  self-hosted Worker holds it too (`SASONICA_HMAC_KEY`), because it is the
+  Worker that signs each row. What the key buys is that the database alone
+  cannot run anything. Hosted, it means South Pen Labs' relay could sign a
+  row for any tenant: the same trust a person places in any relay that
+  queues commands for them, and the hosted tier has to say so plainly.
 - **Sign-in is approved on the owner's phone** (§6 of
   `tools-and-approvals.md`, `SASONICA_SIGNIN=app`), signed with the machine's
   key. It works unchanged hosted: the relay never sees the key.
@@ -95,3 +101,44 @@ beyond what is included, and a user's queue is kilobytes.
   host (`relay.sasonica.com/t/<id>/mcp`) or a subdomain each.
 - Rate limits per tenant, and what happens to a tenant whose account lapses
   (its machine keeps its data; the relay stops routing).
+
+## Built (4 Oct 2026)
+
+- **`worker/src/tenant.ts`** — `TenantCore`, one tenant over its Durable
+  Object's SQLite: the same `schema.sql`, and the same `runnerApi` and
+  `mcpServe` as a self-hosted Worker, handed a D1-shaped binding
+  (`d1Over`) over the object's own storage. The runner token and the
+  connector secret are kept as sha256 only; the HMAC key is kept as is (see
+  above). `relayFetch` routes `/t/<tenant>/…` to the tenant's object with the
+  prefix taken off, so a machine's `SASONICA_WORKER_URL` is
+  `https://<relay>/t/<tenant>` and **the runner and the connector URL are
+  unchanged**: `/runner`, `/runner/ws`, `/<secret>/mcp` beneath it. A probe at
+  a made-up tenant id is a 404 and creates no storage.
+- **`worker/src/hosted.ts`** — the `Tenant` Durable Object and the entry
+  point; `worker/wrangler.relay.jsonc` deploys it as `sasonica-relay`.
+- **The doorbell.** A tenant never holds a claim open (a held request is
+  billed by the second). The claim answers `doorbell: true`, and an idle
+  runner keeps a WebSocket at `/runner/ws` (token as the first message —
+  a WebSocket cannot set headers — then `ready`, then `ring` whenever a row
+  is queued) and claims when it rings, or every 2 minutes regardless. The
+  socket hibernates, and `ping`/`pong` is answered without waking the
+  object. Measured under `wrangler dev`: a command round trip in 0.3 s, and
+  **no requests at all from an idle runner** over 40 s; a relay restart is
+  picked up and the next command runs. A self-hosted Worker never offers the
+  bell, so nothing changes there.
+- **Tenants kept apart, tested** (`tests/check-relay.mjs`, in CI): one
+  tenant's runner token, connector URL and rows mean nothing on another.
+  This found a real hole: the per-isolate cache of connector secrets was
+  keyed by the secret's hash alone, so in an isolate serving two tenants,
+  tenant A's URL secret, once looked up, would have opened tenant B's shell.
+  The cache is now keyed by tenant too (`SASONICA_TENANT`).
+- **Making a tenant:** `POST /tenants {account}` with `RELAY_ADMIN_TOKEN`
+  answers the machine's `SASONICA_WORKER_URL`, `SASONICA_RUNNER_TOKEN`,
+  `SASONICA_URL_SECRET`, the key for `relay.key`, and the connector URL —
+  shown once.
+
+**Not yet:** `sasonica install --hosted` (joining by a Sasonica account
+sign-in instead of the admin token, which needs an OAuth client for the
+relay on cms.sasonica.com); the tenant list per account; OAuth sign-in for
+hosted connectors (the secret URL works today); rate limits; the deploy
+itself (`relay.sasonica.com` on the South Pen Labs account).

@@ -965,6 +965,66 @@ function trimNonces() {
  *  normal poll interval applies). */
 let lastWaited = false;
 
+// --- the doorbell (the hosted relay, docs/hosted-relay.md) --------------------
+// A relay that answers claims with `doorbell: true` will not hold them open
+// (a held request is billed by the second there). Instead an idle runner keeps
+// one WebSocket to it at <worker>/runner/ws, sends its token as the first
+// message, hears 'ready', and then 'ring' whenever a row is queued -- and
+// claims then. The socket hibernates on the relay's side, so an idle machine
+// costs next to nothing. A self-hosted Worker never offers it, and nothing
+// here changes for one.
+const BELL_MAX_MS = 120_000;      // claim at least this often, bell or not
+const BELL_PING_MS = 45_000;      // keepalive; answered without waking the relay
+let bellOffered = false;
+let bell = null;                  // { ws, ready, rang, wake, lastPong }
+let bellRetryAt = 0;
+
+function openBell() {
+  if (typeof WebSocket !== 'function') return null;
+  let ws;
+  try { ws = new WebSocket(`${WORKER_URL.replace(/^http/, 'ws')}/runner/ws`); } catch { return null; }
+  const b = { ws, ready: false, rang: false, wake: null, lastPong: Date.now(), ping: null };
+  const ring = () => { b.rang = true; const w = b.wake; b.wake = null; w?.(); };
+  ws.addEventListener('open', () => ws.send(JSON.stringify({ token: RUNNER_TOKEN, runner: RUNNER_ID })));
+  ws.addEventListener('message', (e) => {
+    const m = String(e.data);
+    if (m === 'pong') b.lastPong = Date.now();
+    else if (m === 'ready') { b.ready = true; b.lastPong = Date.now(); log('doorbell connected'); ring(); }
+    else if (m === 'ring') ring();
+  });
+  b.ping = setInterval(() => {
+    // Two keepalives unanswered: a dead path no close event will report.
+    if (Date.now() - b.lastPong > BELL_PING_MS * 2 + 5_000) { try { ws.close(); } catch { /* gone */ } gone(); return; }
+    try { ws.send('ping'); } catch { /* the close handler follows */ }
+  }, BELL_PING_MS);
+  const gone = () => {
+    clearInterval(b.ping);
+    if (bell !== b) return;
+    bell = null;
+    // Never got as far as 'ready': back off, and poll plainly meanwhile.
+    if (!b.ready) bellRetryAt = Date.now() + 30_000;
+    ring();                       // claim now: a row may have come while it was down
+  };
+  ws.addEventListener('close', gone);
+  ws.addEventListener('error', gone);
+  return b;
+}
+
+/** Until the bell rings (or it is time to claim anyway). */
+async function waitForBell() {
+  if (!bell) {
+    if (Date.now() < bellRetryAt || !(bell = openBell())) { await sleep(T.POLL * 1000); return; }
+  }
+  const b = bell;
+  if (!b.rang) {
+    await new Promise((resolve) => {
+      const t = setTimeout(resolve, BELL_MAX_MS);
+      b.wake = () => { clearTimeout(t); resolve(); };
+    });
+  }
+  b.rang = false;
+}
+
 async function poll() {
   reloadTunables();
   await publishTools();          // a no-op unless a manifest changed
@@ -980,9 +1040,13 @@ async function poll() {
   // rather than one per poll. While anything runs, the normal short poll,
   // so a cancel or a detach is picked up promptly.
   const idle = !fgBusy() && bgJobs.size === 0 && T.LONG_WAIT > 0;
-  const { rows, signins, waited } = await api('claim', {
-    fg, bg, ...(idle ? { wait: T.LONG_WAIT, signins_seen: lastSignins } : {}) });
-  lastWaited = !!waited;
+  // A relay with a doorbell: wait on the socket, then a plain claim.
+  const rung = idle && bellOffered;
+  if (rung) await waitForBell();
+  const { rows, signins, waited, doorbell } = await api('claim', {
+    fg, bg, ...(idle && !rung ? { wait: T.LONG_WAIT, signins_seen: lastSignins } : {}) });
+  bellOffered = !!doorbell && typeof WebSocket === 'function';
+  lastWaited = !!waited || rung;
   if (typeof signins === 'number') await noteSignins(signins);
   for (const row of rows) {
     const lane = Number(row.background) === 1 || T.PARALLEL > 1 ? 'bg' : 'fg';
