@@ -1,6 +1,8 @@
 # Proposal: a hosted relay, for people with no Cloudflare account (27 Sep 2026)
 
-Status: **steps 2 and 3 built, and live at `https://relay.sasonica.com`**
+Status: **steps 2 and 3 built, and live at `https://relay.sasonica.com`;
+ready to open as a free beta (8 Oct 2026, "Opening it" below) except for the
+switch itself**
 (Worker `sasonica-relay`, South Pen Labs account; 4 Oct 2026, David: "let's do
 it" — the hosted relay is next, ahead of any hosted compute). See "Built"
 below. **Decided (David, 27 Sep 2026): self-hosting
@@ -151,11 +153,121 @@ The installer collects the credentials once and writes the env file
 (`SASONICA_HOSTED=1`, `SASONICA_RELAY_URL`) and `relay.key`; a join expires
 after 15 minutes. One Durable Object per join (`Join`), wiped by an alarm.
 
-**Not yet:** the tenant list per account (and removing a machine); OAuth sign-in for
-hosted connectors (the secret URL works today); rate limits; deleting a tenant (the live
-test's, `vjky5htb3q34kiut`, is still there with its credentials thrown away).
+**Not yet:** OAuth sign-in for hosted connectors (the secret URL works today).
+The account list, removal, rate limits and retention were built for opening
+(below).
 
 **Deployed 4 Oct 2026**: `npx wrangler deploy -c wrangler.relay.jsonc` with
 red5's `SPL_CLOUDFLARE_TOKEN`; `RELAY_ADMIN_TOKEN` is in red5's
 `~/.config/sasonica-relay/admin.env`. A throwaway runner on red5 joined a
 tenant made there and ran commands through the connector URL in 0.32 s each.
+
+## Opening it: a free beta (built 8 Oct 2026)
+
+David, 8 Oct 2026: a **free beta first**, billing later. Built and deployed
+(sasonica-shell `a3d7943`, `90e0bc5`; websites `f153eab`); `tests/check-relay.mjs`
+has a case for each. What stays David's call: `RELAY_ALLOW_ACCOUNTS=*`.
+
+- **Rate limits**, per minute, as vars in `wrangler.relay.jsonc`:
+  `RELAY_JOIN_PER_MIN` 5 (`/join/start` and the account page's sign-in, per
+  client IP), `RELAY_MCP_PER_MIN` 120 (per connector URL), `RELAY_RUNNER_PER_MIN`
+  300 (per runner token; a busy runner claims every 5 s and sends a heartbeat
+  per running job every 3 s). Over the limit is a 429 with `Retry-After: 60`
+  (a JSON-RPC error for MCP); the runner waits it out and retries rather than
+  lose a result. Counted exactly, in memory, in Durable Objects: a tenant
+  counts its own calls keyed by the credential's hash (so a stranger guessing
+  at a tenant's URL spends their own allowance, not the owner's), and a
+  `Limiter` object per client IP counts joins. Never per IP for MCP: an
+  assistant's calls come from its vendor's servers. Cloudflare's rate-limit
+  binding was tried first and, deployed, let every request through (40 joins
+  a minute from one IP, 140 MCP calls against 120) though it worked under
+  `wrangler dev`. Measured live after the change: 120 pings then 429; the 6th
+  join in a minute refused; ten calls at a wrong URL left the owner's 120 intact.
+- **One machine per account** (`RELAY_MACHINES_PER_ACCOUNT`, 1). A second join
+  **replaces** the first rather than being refused: reinstalling, or moving to
+  a new computer, is the common case, and refusing would send the person off
+  to find a remove page first. It is safe because only the account's owner
+  gets to the Join page (signed in, matching the code), and the page says
+  before the button which machine goes ("Replace and join"). The new tenant
+  is made first; the old one is removed only once that worked.
+- **Retention on the relay**, whatever the client does: each tenant has a
+  daily alarm that deletes command rows older than `RELAY_KEEP_DAYS` (30,
+  pending or not) and sign-ins older than a day, and removes the tenant
+  outright (from its account's list too) when no runner has been in touch for
+  `RELAY_DORMANT_DAYS` (90). Runner contact is the runner API or the doorbell
+  with its token, written at most hourly. A tenant made before this gets its
+  alarm on first use, and its clock starts then.
+- **An account's machines.** An `Account` object per account lists its tenants
+  (ids, machine names, dates; no credentials). `https://relay.sasonica.com/account`
+  signs in at cms.sasonica.com (the same `sasonica-relay` client and redirect
+  URI as joining, told apart by the state) and lists the machines with when
+  each was last seen and a **Remove** button. The same with any Sasonica access
+  token: `GET /account/machines`, `DELETE /account/machines/<tenant>`
+  (`Authorization: Bearer`). Removing deletes the tenant's storage at once.
+- **Account deletion.** `sasonica_oidc` (websites) implements
+  `hook_user_delete`: it posts `{account: "https://cms.sasonica.com|<uid>"}` to
+  `/hooks/account-deleted` with `SASONICA_RELAY_HOOK_TOKEN` (red4's
+  `sasonica/app.env`; the Worker secret `RELAY_ACCOUNT_HOOK_TOKEN`, a token
+  that can do nothing else). A failed call is retried on cron for 90 days. The
+  delete page says relay machines go. Tested live: a throwaway account's
+  tenant was gone the moment the account was deleted.
+- **Admin** (`RELAY_ADMIN_TOKEN`): `GET`/`DELETE /admin/tenants/<id>`,
+  `POST /admin/tenants/<id>/index` (lists a tenant made before the account
+  list under its account), `GET /admin/accounts/<account, URL-encoded>`.
+- **Removed:** the 4 Oct live test's tenant `vjky5htb3q34kiut` (its account
+  was literally `live-test (David, 4 Oct 2026)`, its credentials long thrown
+  away). No other tenant id was known; David's account had none listed. A
+  tenant joined before 8 Oct that is still in use can be listed with the
+  `index` route above.
+
+### The Windows end-to-end run (prepared, not run)
+
+A second account for it: **`sasonica-test2`** (uid 5, davidj4test1@gmail.com),
+made 8 Oct 2026; its password is in red5's
+`~/.config/sasonica-relay/test2.env` (0600), or use "Forgot password" with the
+test address. It is **not yet allowed** on the relay. To admit it beside
+David's, change one line in `worker/wrangler.relay.jsonc`:
+
+```jsonc
+    "RELAY_ALLOW_ACCOUNTS": "https://cms.sasonica.com|1,https://cms.sasonica.com|5",
+```
+
+and deploy it (red5, from `worker/`):
+
+```sh
+set -a; . ~/.config/cloudflare/env; set +a
+CLOUDFLARE_API_TOKEN=$SPL_CLOUDFLARE_TOKEN npx wrangler deploy -c wrangler.relay.jsonc
+```
+
+Then on the Windows machine (Windows PowerShell 5.1, no Cloudflare account):
+
+1. `irm https://sasonica.com/install.ps1 | iex` — downloads the repo to
+   `%LOCALAPPDATA%\sasonica\shell`, gets Node if missing, runs
+   `install.ps1 -Hosted`; it prints a link and a six-character code.
+2. Open the link, sign in as `sasonica-test2`, check the code matches, press
+   **Join**. The installer finishes on its own: `%APPDATA%\sasonica\env` has
+   `SASONICA_HOSTED=1` and a `https://relay.sasonica.com/t/<tenant>` Worker
+   URL, and the Scheduled Task is running.
+3. Add the connector URL it printed to an assistant (claude.ai: Settings,
+   Connectors), and run `hostname` and `Get-Date` through it; then a 40-second
+   command with `wait: 0`, `get_result` with a wait, and `cancel` on a
+   `Start-Sleep 120`.
+4. `https://relay.sasonica.com/account` signed in as `sasonica-test2`: the
+   machine is listed with a recent "last seen".
+5. Run the installer again on the same machine: the Join page offers
+   **Replace and join** naming the old one; after it, the first tenant's URL
+   is a 404 and the new one works.
+6. Remove it on `/account`: the runner's requests start failing (404) and the
+   connector says nothing is there. Optionally delete `sasonica-test2` at
+   cms.sasonica.com and check `/hooks/account-deleted` left nothing
+   (`GET /admin/accounts/https%3A%2F%2Fcms.sasonica.com%7C5`).
+7. Put `RELAY_ALLOW_ACCOUNTS` back to David's alone (or open it) and deploy.
+
+### What remains before `RELAY_ALLOW_ACCOUNTS=*` (David's call)
+
+- The Windows run above.
+- Publishing Google sign-in in Google's OAuth console (out of testing mode).
+- The terms of service: a draft is in websites
+  `sites/sasonica/content/terms-of-service.md`, for David to review and publish.
+- The privacy policy's "not yet open to everyone" line, changed on opening;
+  sasonica.com/start and /download's "coming soon" for Windows.
