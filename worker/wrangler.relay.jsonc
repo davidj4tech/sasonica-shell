@@ -40,7 +40,7 @@
   // requests per runner token (a busy runner claims every 5 s and sends a
   // heartbeat per running job every 3 s, so 300 leaves it room).
   "vars": {
-    "RELAY_ALLOW_ACCOUNTS": "https://cms.sasonica.com|1",
+    "RELAY_ALLOW_ACCOUNTS": "https://cms.sasonica.com|1,https://cms.sasonica.com|5",
     "RELAY_MACHINES_PER_ACCOUNT": "1",
     "RELAY_KEEP_DAYS": "30",
     "RELAY_DORMANT_DAYS": "90",

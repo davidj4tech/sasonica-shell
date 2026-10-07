@@ -1,0 +1,93 @@
+# The hosted relay joined from a real Windows machine, by the one line a
+# person runs (docs/hosted-relay.md, "The Windows end-to-end run"). Manual
+# only: someone has to open the join link it prints, sign in and press Join.
+#
+# The log is public. The join link and code are one-time and fine to show;
+# the connector URL is a credential, so it never appears in it: the installer's
+# output is printed with the URL's secret replaced, and the URL itself only
+# encrypted to the RSA public key given as `pubkey` (base64 of a PEM), for
+# whoever holds the private key to decrypt:
+#   gh workflow run windows-hosted-e2e.yml -f pubkey="$(base64 -w0 pub.pem)"
+#   ...  | base64 -d | openssl pkeyutl -decrypt -inkey key.pem \
+#          -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+name: Windows hosted relay (end to end)
+on:
+  workflow_dispatch:
+    inputs:
+      pubkey:
+        description: RSA public key (base64 of the PEM) to encrypt the connector URL to
+        required: true
+      minutes:
+        description: Minutes to stay up after joining, for commands through the relay
+        default: '15'
+permissions:
+  contents: read
+jobs:
+  hosted-e2e:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: irm https://sasonica.com/install.ps1 | iex
+        shell: powershell
+        env:
+          PUBKEY: ${{ inputs.pubkey }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'install.out'
+          $err = Join-Path $env:RUNNER_TEMP 'install.err'
+          # A process of its own, as a person's PowerShell window would be,
+          # with its output to files this step reads (and redacts) as it goes.
+          $p = Start-Process powershell.exe -PassThru -NoNewWindow `
+            -RedirectStandardOutput $out -RedirectStandardError $err `
+            -ArgumentList '-NoProfile', '-Command', 'irm https://sasonica.com/install.ps1 | iex'
+          $redact = { param($s) $s -replace '(/t/[A-Za-z0-9_-]+/)[A-Za-z0-9_-]+(/mcp)', '$1<secret>$2' }
+          $shown = 0
+          while ($true) {
+            $done = $p.HasExited
+            $lines = @(if (Test-Path $out) { Get-Content $out })
+            for ($i = $shown; $i -lt $lines.Count; $i++) { Write-Host (& $redact $lines[$i]) }
+            $shown = $lines.Count
+            if ($done) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (Test-Path $err) { Get-Content $err | ForEach-Object { Write-Host (& $redact $_) } }
+          if ($p.ExitCode -ne 0) { throw "the installer stopped (exit $($p.ExitCode))" }
+          $url = (Get-Content $out | Select-String -Pattern 'https://\S+/t/\S+/mcp' | Select-Object -Last 1).Matches[0].Value
+          if (-not $url) { throw 'no connector URL in the installer output' }
+          $env:CONNECTOR = $url
+          $enc = node -e "const c=require('crypto');const k=Buffer.from(process.env.PUBKEY,'base64').toString();process.stdout.write(c.publicEncrypt({key:k,padding:c.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},Buffer.from(process.env.CONNECTOR)).toString('base64'))"
+          Write-Host "CONNECTOR-ENC: $enc"
+
+      - name: The runner, as the Scheduled Task left it
+        shell: powershell
+        run: |
+          $redact = { param($s) $s -replace '(/t/[A-Za-z0-9_-]+/)[A-Za-z0-9_-]+(/mcp)', '$1<secret>$2' }
+          $task = Get-ScheduledTask -TaskName 'sasonica-shell'
+          $task | Format-List TaskName, State
+          # The task is an Interactive logon, and a hosted runner has no one
+          # logged on, so it can sit at Ready: then start its action directly.
+          # A limit of CI, not of the installer.
+          if ($task.State -ne 'Running') {
+            $a = $task.Actions[0]
+            Write-Host "task is $($task.State): starting its action directly"
+            Start-Process $a.Execute -ArgumentList $a.Arguments -WorkingDirectory $a.WorkingDirectory -WindowStyle Hidden
+            Start-Sleep -Seconds 10
+          }
+          Get-Process node -ErrorAction SilentlyContinue | Format-Table Id, StartTime, Path
+          & (Join-Path $env:APPDATA 'sasonica\bin\sasonica.cmd') status 2>&1 | ForEach-Object { Write-Host (& $redact "$_") }
+
+      - name: Stay up for commands through the relay
+        shell: powershell
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          $log = Join-Path $env:APPDATA 'sasonica\runner.log'
+          $end = (Get-Date).AddMinutes([int]$env:MINUTES)
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+            $state = (Get-ScheduledTask -TaskName 'sasonica-shell').State
+            $tail = if (Test-Path $log) { (Get-Content $log -Tail 3) -join ' | ' } else { '(no log)' }
+            $tail = $tail -replace '(/t/[A-Za-z0-9_-]+/)[A-Za-z0-9_-]+(/mcp)', '$1<secret>$2'
+            Write-Host "$(Get-Date -Format HH:mm:ss) task $state; log: $tail"
+          }
