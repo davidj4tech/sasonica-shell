@@ -225,13 +225,14 @@ has a case for each. What stays David's call: `RELAY_ALLOW_ACCOUNTS=*`.
   tenant joined before 8 Oct that is still in use can be listed with the
   `index` route above.
 
-### The Windows end-to-end run (prepared, not run)
+### The Windows end-to-end run (passed 8 Oct 2026)
 
 A second account for it: **`sasonica-test2`** (uid 5, davidj4test1@gmail.com),
 made 8 Oct 2026; its password is in red5's
 `~/.config/sasonica-relay/test2.env` (0600), or use "Forgot password" with the
-test address. It is **not yet allowed** on the relay. To admit it beside
-David's, change one line in `worker/wrangler.relay.jsonc`:
+test address. It is **allowed** on the relay beside David's (74fc418,
+deployed 8 Oct 2026), kept for future runs. The line in
+`worker/wrangler.relay.jsonc`:
 
 ```jsonc
     "RELAY_ALLOW_ACCOUNTS": "https://cms.sasonica.com|1,https://cms.sasonica.com|5",
@@ -268,9 +269,36 @@ Then on the Windows machine (Windows PowerShell 5.1, no Cloudflare account):
    (`GET /admin/accounts/https%3A%2F%2Fcms.sasonica.com%7C5`).
 7. Put `RELAY_ALLOW_ACCOUNTS` back to David's alone (or open it) and deploy.
 
+**Run on GitHub's Windows runner, 8 Oct 2026** (`.github/workflows/
+windows-hosted-e2e.yml`, manual only; red5 has no KVM for a Windows VM).
+The job runs the real one-liner on windows-latest (Windows Server 2025,
+10.0.26100) and posts the join link, then the connector URL encrypted to a
+key passed in, as check runs (a step's log can't be read until the job
+ends); red5 signed in as `sasonica-test2` with headless Chromium and pressed
+Join. Results:
+
+- [Run 37701441963](https://github.com/davidj4tech/sasonica-shell/actions/runs/37701441963):
+  joined; the installer's smoke test queued `echo sasonica-ok` through the
+  hosted relay and read it back; the Scheduled Task reported **Running**
+  (the worry that an Interactive task would sit at Ready on a runner with no
+  one logged on didn't happen); the connector URL printed as `<secret>`.
+  The job then failed on the workflow's own bug (an empty ExitCode from
+  Start-Process without its handle held), fixed in 2e6dba9.
+- [Run 37701570159](https://github.com/davidj4tech/sasonica-shell/actions/runs/37701570159):
+  all steps green. The Join page replaced the first run's machine ("Removed
+  from your relay: runnervmfi6oq"; its tenant then 404). An MCP client on
+  red5 (initialize, then `tools/call run_command`) ran `hostname; uname -a;
+  cmd.exe /c ver` on the runner through the relay: `runnervmfi6oq`, MSYS on
+  Windows 10.0.26100, `Microsoft Windows [Version 10.0.26100.33438]`, exit 0.
+- Cleanup: both tenants removed (404), the account's machine list empty,
+  the run cancelled, the key pair deleted.
+
+Not covered by this run: a person adding the connector to claude.ai, the
+long-command `wait: 0` / `get_result` / `cancel` steps, and the
+`/account` Remove button (each tested on Linux).
+
 ### What remains before `RELAY_ALLOW_ACCOUNTS=*` (David's call)
 
-- The Windows run above.
 - Publishing Google sign-in in Google's OAuth console (out of testing mode).
 - The terms of service: a draft is in websites
   `sites/sasonica/content/terms-of-service.md`, for David to review and publish.
