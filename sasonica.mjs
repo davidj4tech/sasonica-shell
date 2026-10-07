@@ -641,13 +641,19 @@ if (sub === 'status') {
 // --- the Worker -------------------------------------------------------------
 // Every exchange is POST /runner with an `op`. No SQL is built here any more,
 // so neither is any SQL escaping.
-async function api(op, body = {}) {
+async function api(op, body = {}, tries = 3) {
   const r = await fetch(`${WORKER_URL}/runner`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${RUNNER_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ op, runner: RUNNER_ID, ...body }),
     signal: AbortSignal.timeout(60_000),
   });
+  // The hosted relay's rate limit (docs/hosted-relay.md): wait and try
+  // again rather than lose a result. A self-hosted Worker never sends it.
+  if (r.status === 429 && tries > 1) {
+    await sleep(Math.min(Math.max(Number(r.headers.get('retry-after')) || 10, 1), 20) * 1000);
+    return api(op, body, tries - 1);
+  }
   // A 404 is what a wrong or missing token looks like, deliberately: the
   // Worker will not confirm that the runner API is there.
   if (r.status === 404) {

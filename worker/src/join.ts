@@ -40,7 +40,7 @@ export interface Creds {
 
 type Status = 'started' | 'signed-in' | 'joined'
 
-function b64url(bytes: ArrayBuffer): string {
+export function b64url(bytes: ArrayBuffer): string {
   let bin = ''
   for (const b of new Uint8Array(bytes)) bin += String.fromCharCode(b)
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
@@ -115,7 +115,7 @@ export class JoinCore {
    */
   async callback(code: string, origin: string, allowed: (account: string) => boolean,
                  fetcher: typeof fetch = fetch): Promise<
-    { machine: string; code: string; confirm: string; who: string } | { error: string }> {
+    { machine: string; code: string; confirm: string; who: string; account: string } | { error: string }> {
     const s = this.get()
     if (!s || s.status !== 'started') return { error: 'This join has expired or was already used. Run the installer again.' }
     const tok = await fetcher(`${ISSUER}/oauth/token`, {
@@ -139,7 +139,7 @@ export class JoinCore {
     }
     const who = String(info?.preferred_username || info?.name || info?.email || `account ${sub}`).slice(0, 80)
     this.put({ status: 'signed-in', account, who })
-    return { machine: s.machine, code: s.code, confirm: s.confirm, who }
+    return { machine: s.machine, code: s.code, confirm: s.confirm, who, account }
   }
 
   /** Step 3, the button: the account and machine to make a tenant for. */
@@ -187,14 +187,29 @@ button{font:inherit;padding:.6rem 1.4rem;border-radius:.5rem;border:0;background
   })
 }
 
-export function confirmPage(id: string, p: { machine: string; code: string; confirm: string; who: string }): Response {
+/**
+ * The Join page. `replacing` is what joining this machine would remove: the
+ * beta keeps one machine per account (RELAY_MACHINES_PER_ACCOUNT), and a
+ * second join replaces the first rather than being refused -- the person
+ * reinstalling, or moving to a new computer, is the common case -- but it
+ * says so before the button, never after.
+ */
+export function confirmPage(id: string, p: { machine: string; code: string; confirm: string; who: string },
+                            replacing: string[] = []): Response {
+  const names = replacing.map((m) => `<b>${esc(m)}</b>`).join(', ')
+  const swap = replacing.length
+    ? `<p>Your account already has ${names} on the relay. During the beta an account has
+${replacing.length === 1 ? 'one machine' : 'a limited number of machines'}, so joining this one <b>removes ${names}</b>:
+its queue and history on the relay are deleted and its runner stops working with the relay.</p>`
+    : ''
   return page('Add this machine to your relay?', `
 <p>Signed in as <b>${esc(p.who)}</b>.</p>
 <p>The machine <b>${esc(p.machine)}</b> wants to join, so assistants you connect can run commands on it.
 Only go on if the installer on that machine shows this code:</p>
 <p class="code">${esc(p.code)}</p>
+${swap}
 <form method="post" action="/join/${esc(id)}/confirm">
 <input type="hidden" name="confirm" value="${esc(p.confirm)}">
-<button type="submit">Join</button></form>
+<button type="submit">${replacing.length ? 'Replace and join' : 'Join'}</button></form>
 <p>If you did not start this, close the page; nothing is added.</p>`)
 }

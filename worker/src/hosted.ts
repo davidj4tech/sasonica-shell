@@ -6,14 +6,17 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import SCHEMA from '../../schema.sql'
-import { accountAllowed, relayFetch, TenantCore, type RelayEnv, type TenantInit } from './tenant.ts'
+import { accountAllowed, DAY_MS, relayFetch, relaySettings, TenantCore, type RelayEnv, type TenantInit } from './tenant.ts'
 import { JOIN_TTL_MS, JoinCore, type Creds } from './join.ts'
+import { AccountCore, type MachineEntry } from './account.ts'
 
 /** Unauthenticated sockets kept at most; past this the oldest go. */
 const MAX_PENDING_SOCKETS = 4
 
 export class Tenant extends DurableObject<RelayEnv> {
   private core: TenantCore
+  /** Whether this instance has made sure the retention alarm is set. */
+  private alarmChecked = false
 
   constructor(ctx: DurableObjectState, env: RelayEnv) {
     super(ctx, env)
@@ -24,7 +27,52 @@ export class Tenant extends DurableObject<RelayEnv> {
   }
 
   async init(t: TenantInit) {
-    return this.core.init(t)
+    const r = this.core.init(t)
+    if ('ok' in r) await this.ctx.storage.setAlarm(Date.now() + DAY_MS)
+    return r
+  }
+
+  info() {
+    return this.core.info()
+  }
+
+  /** The tenant, gone: sockets closed, alarm off, every row deleted. */
+  async destroy() {
+    for (const ws of this.ctx.getWebSockets()) {
+      try { ws.close(1000, 'removed') } catch { /* already gone */ }
+    }
+    this.core.forget()
+    await this.ctx.storage.deleteAlarm()
+    await this.ctx.storage.deleteAll()
+    return true
+  }
+
+  /**
+   * Retention, daily, on the relay itself (docs/hosted-relay.md): rows past
+   * RELAY_KEEP_DAYS go whatever the client does, and a tenant whose runner
+   * has not been in touch for RELAY_DORMANT_DAYS is removed, from its
+   * account's list too.
+   */
+  async alarm() {
+    const { keepDays, dormantDays } = relaySettings(this.env)
+    const info = this.core.info()
+    if (!info) { await this.ctx.storage.deleteAll(); return }
+    const r = this.core.retain(Date.now(), keepDays, dormantDays)
+    if (r.dormant) {
+      await this.env.ACCOUNTS.get(this.env.ACCOUNTS.idFromName(info.account)).remove(info.tenant)
+      await this.destroy()
+      return
+    }
+    await this.ctx.storage.setAlarm(Date.now() + DAY_MS)
+  }
+
+  /** Tenants made before retention existed get their alarm on first use. */
+  private async ensureAlarm() {
+    if (this.alarmChecked) return
+    this.alarmChecked = true
+    if (this.core.load() && (await this.ctx.storage.getAlarm()) === null) {
+      await this.ctx.storage.setAlarm(Date.now() + DAY_MS)
+    }
   }
 
   /**
@@ -34,6 +82,7 @@ export class Tenant extends DurableObject<RelayEnv> {
    * as a message rather than Authorization.
    */
   async fetch(request: Request): Promise<Response> {
+    await this.ensureAlarm()
     if (new URL(request.url).pathname === '/runner/ws') {
       if (!this.core.load() || request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
         return new Response('not found', { status: 404 })
@@ -55,6 +104,7 @@ export class Tenant extends DurableObject<RelayEnv> {
     try { token = String(JSON.parse(String(message))?.token ?? '') } catch { token = '' }
     if (await this.core.runnerOk(token)) {
       ws.serializeAttachment({ ok: true })
+      this.core.noteRunner()
       ws.send('ready')
     } else {
       ws.close(1008, 'no')
@@ -98,6 +148,25 @@ export class Join extends DurableObject<RelayEnv> {
   async alarm() {
     this.core.wipe()
     await this.ctx.storage.deleteAll()
+  }
+}
+
+/** One Sasonica account's list of tenants (./account.ts). */
+export class Account extends DurableObject<RelayEnv> {
+  private core: AccountCore
+
+  constructor(ctx: DurableObjectState, env: RelayEnv) {
+    super(ctx, env)
+    this.core = new AccountCore(ctx.storage)
+  }
+
+  list() { return this.core.list() }
+  add(e: MachineEntry) { this.core.add(e) }
+  async remove(tenant: string) {
+    const was = this.core.remove(tenant)
+    // An account with no machines keeps nothing here.
+    if (was && !this.core.list().length) await this.ctx.storage.deleteAll()
+    return was
   }
 }
 

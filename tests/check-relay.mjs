@@ -16,10 +16,13 @@ import { sign } from './fake-d1.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA = readFileSync(path.join(HERE, '..', 'schema.sql'), 'utf8');
-const { TenantCore, relayFetch, accountAllowed } = await import('../worker/src/tenant.ts');
+const { TenantCore, relayFetch, accountAllowed, DAY_MS } = await import('../worker/src/tenant.ts');
+const { AccountCore } = await import('../worker/src/account.ts');
 const { JoinCore, JOIN_TTL_MS } = await import('../worker/src/join.ts');
 const { resetClientCache } = await import('../worker/src/index.ts');
 const ADMIN = 'admin-token-under-test';
+const HOOK = 'hook-token-under-test';
+const DAVID = 'https://cms.sasonica.com|1';
 
 // ctx.storage as a Durable Object gives it: sql.exec (one statement with
 // bindings, or a script without) and transactionSync.
@@ -57,12 +60,34 @@ function fakeRelay() {
         const storage = fakeStorage();
         rings.set(name, 0);
         const core = new TenantCore(storage, SCHEMA, () => rings.set(name, rings.get(name) + 1));
-        objects.set(name, { core, storage, fetch: (r) => core.fetch(r), init: async (t) => core.init(t) });
+        objects.set(name, {
+          core, storage, fetch: (r) => core.fetch(r), init: async (t) => core.init(t), info: async () => core.info(),
+          // What deleteAll does to a Durable Object: nothing of it is left.
+          destroy: async () => {
+            for (const { name: t } of storage.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`).all()) {
+              storage.db.exec(`DROP TABLE "${t}"`);
+            }
+            core.forget();
+            return true;
+          },
+        });
       }
       return objects.get(name);
     },
   };
+  const accounts = new Map();
+  const ACCOUNTS = {
+    idFromName: (name) => name,
+    get(name) {
+      if (!accounts.has(name)) {
+        const core = new AccountCore(fakeStorage());
+        accounts.set(name, { core, list: async () => core.list(), add: async (e) => core.add(e), remove: async (t) => core.remove(t) });
+      }
+      return accounts.get(name);
+    },
+  };
   // The issuer, as far as a join sees it: the token endpoint and userinfo.
+  // Access token 'at' is whoever signed in last (issuer.sub); 'tok-<sub>' is that account's.
   const issuer = { sub: '1', calls: [] };
   const fetcher = async (u, init = {}) => {
     issuer.calls.push({ url: String(u), body: init.body ? String(init.body) : '' });
@@ -71,7 +96,12 @@ function fakeRelay() {
         ? Response.json({ access_token: 'at', token_type: 'Bearer' })
         : Response.json({ error: 'invalid_grant' }, { status: 400 });
     }
-    if (String(u).endsWith('/oauth/userinfo')) return Response.json({ sub: issuer.sub, preferred_username: 'david' });
+    if (String(u).endsWith('/oauth/userinfo')) {
+      const tok = String(new Headers(init.headers).get('authorization') ?? '').replace(/^Bearer /, '');
+      const sub = tok === 'at' ? issuer.sub : (/^tok-(\d+)$/.exec(tok)?.[1] ?? '');
+      return sub ? Response.json({ sub, preferred_username: sub === '1' ? 'david' : `user${sub}` })
+        : Response.json({ error: 'invalid_token' }, { status: 401 });
+    }
     return new Response('?', { status: 404 });
   };
   const clock = { now: Date.now() };
@@ -94,9 +124,18 @@ function fakeRelay() {
       return joins.get(name);
     },
   };
-  const env = { TENANTS, JOINS, RELAY_ADMIN_TOKEN: ADMIN, RELAY_ALLOW_ACCOUNTS: 'https://cms.sasonica.com|1' };
+  // Cloudflare's rate-limit binding, exactly counted: `limit` per key, until reset.
+  const limiter = (limit) => {
+    const seen = new Map();
+    return { seen, limit: async ({ key }) => { seen.set(key, (seen.get(key) ?? 0) + 1); return { success: seen.get(key) <= limit }; } };
+  };
+  const env = {
+    TENANTS, JOINS, ACCOUNTS, RELAY_ADMIN_TOKEN: ADMIN, RELAY_ALLOW_ACCOUNTS: 'https://cms.sasonica.com|1,https://cms.sasonica.com|2',
+    RELAY_ACCOUNT_HOOK_TOKEN: HOOK, JOIN_LIMIT: limiter(1000), MCP_LIMIT: limiter(1000), RUNNER_LIMIT: limiter(1000),
+    ISSUER_FETCH: fetcher,
+  };
   const go = (p, init = {}) => relayFetch(new Request(`https://relay.example${p}`, init), env);
-  return { env, objects, rings, go, issuer, clock };
+  return { env, objects, accounts, rings, go, issuer, clock, limiter };
 }
 
 // A join up to its confirm page: start, the redirect, the callback.
@@ -112,9 +151,9 @@ const confirmJoin = (relay, id, nonce) => relay.go(`/join/${id}/confirm`, {
   method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `confirm=${nonce}` });
 const pollJoin = (relay, id, poll) => relay.go(`/join/${id}/poll`, { method: 'POST', body: JSON.stringify({ poll }) });
 
-async function makeTenant(relay, account = 'https://cms.sasonica.com|1') {
+async function makeTenant(relay, account = 'https://cms.sasonica.com|1', machine = undefined) {
   const r = await relay.go('/tenants', {
-    method: 'POST', headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify({ account }) });
+    method: 'POST', headers: { authorization: `Bearer ${ADMIN}` }, body: JSON.stringify({ account, machine }) });
   assert.equal(r.status, 200);
   return r.json();
 }
@@ -281,7 +320,7 @@ const cases = {
 
   async anAccountOffTheListCannotJoin() {
     const relay = fakeRelay();
-    relay.issuer.sub = '2';
+    relay.issuer.sub = '3';
     const { callback, nonce } = await joinToConfirm(relay);
     assert.equal(callback.status, 403);
     assert.equal(nonce, undefined);
@@ -332,6 +371,194 @@ const cases = {
     assert.ok(!html.includes('<img'));
   },
 };
+
+
+// --- opening it: limits, one machine per account, retention, the account's list ---
+
+Object.assign(cases, {
+  async joinStartIsLimitedPerIp() {
+    const relay = fakeRelay();
+    relay.env.JOIN_LIMIT = relay.limiter(2);
+    const start = (ip) => relay.go('/join/start', { method: 'POST', headers: { 'cf-connecting-ip': ip }, body: '{}' });
+    assert.equal((await start('1.1.1.1')).status, 200);
+    assert.equal((await start('1.1.1.1')).status, 200);
+    const third = await start('1.1.1.1');
+    assert.equal(third.status, 429);
+    assert.equal(third.headers.get('retry-after'), '60');
+    assert.equal((await start('2.2.2.2')).status, 200);
+    // A limiter that fails lets the request through rather than closing the relay.
+    relay.env.JOIN_LIMIT = { limit: async () => { throw new Error('down'); } };
+    assert.equal((await start('1.1.1.1')).status, 200);
+  },
+
+  async mcpAndRunnerAreLimitedPerTenantCredential() {
+    const relay = fakeRelay();
+    relay.env.MCP_LIMIT = relay.limiter(3);
+    relay.env.RUNNER_LIMIT = relay.limiter(2);
+    const a = await makeTenant(relay, 'acct-a');
+    const b = await makeTenant(relay, 'acct-b');
+    // A stranger guessing at A's URL spends their own allowance, not A's.
+    for (let i = 0; i < 5; i++) await mcp(relay, a, 'ping', {}, 'f'.repeat(48));
+    for (let i = 0; i < 3; i++) assert.equal((await mcp(relay, a, 'ping')).status, 200);
+    const over = await mcp(relay, a, 'ping');
+    assert.equal(over.status, 429);
+    assert.equal((await over.json()).error.code, -32000);
+    assert.equal((await mcp(relay, b, 'ping')).status, 200);
+    for (let i = 0; i < 2; i++) assert.equal((await runner(relay, a, { op: 'claim', fg: 1 })).status, 200);
+    assert.equal((await runner(relay, a, { op: 'claim', fg: 1 })).status, 429);
+    assert.equal((await runner(relay, b, { op: 'claim', fg: 1 })).status, 200);
+    // Keys are hashes: no credential is handed to the limiter.
+    const keys = [...relay.env.MCP_LIMIT.seen.keys(), ...relay.env.RUNNER_LIMIT.seen.keys()].join(' ');
+    assert.ok(!keys.includes(a.SASONICA_URL_SECRET) && !keys.includes(a.SASONICA_RUNNER_TOKEN));
+  },
+
+  async aSecondJoinReplacesTheFirstAndSaysSo() {
+    const relay = fakeRelay();
+    const first = await joinToConfirm(relay, 'old-desk');
+    assert.ok(first.html.includes('>Join<') && !first.html.includes('Replace'));
+    await confirmJoin(relay, first.started.id, first.nonce);
+    const old = await (await pollJoin(relay, first.started.id, first.started.poll)).json();
+    assert.equal((await runner(relay, old, { op: 'claim', fg: 1 })).status, 200);
+    // The second join says, before the button, what it will remove.
+    const second = await joinToConfirm(relay, 'new-laptop');
+    assert.ok(second.html.includes('Replace and join'));
+    assert.ok(second.html.includes('removes <b>old-desk</b>'));
+    // Nothing is removed by looking at the page.
+    assert.equal((await runner(relay, old, { op: 'claim', fg: 1 })).status, 200);
+    const done = await (await confirmJoin(relay, second.started.id, second.nonce)).text();
+    assert.ok(done.includes('Removed from your relay: <b>old-desk</b>'));
+    const fresh = await (await pollJoin(relay, second.started.id, second.started.poll)).json();
+    assert.equal((await runner(relay, old, { op: 'claim', fg: 1 })).status, 404);
+    assert.equal((await mcp(relay, old, 'ping')).status, 404);
+    assert.equal((await runner(relay, fresh, { op: 'claim', fg: 1 })).status, 200);
+    assert.deepEqual((await relay.accounts.get(DAVID).list()).map((e) => e.machine), ['new-laptop']);
+    // Configurable: with two allowed, a second machine is simply added.
+    relay.env.RELAY_MACHINES_PER_ACCOUNT = '2';
+    const third = await joinToConfirm(relay, 'pi');
+    assert.ok(!third.html.includes('Replace'));
+    await confirmJoin(relay, third.started.id, third.nonce);
+    assert.deepEqual((await relay.accounts.get(DAVID).list()).map((e) => e.machine).sort(), ['new-laptop', 'pi']);
+  },
+
+  async retentionDropsOldRowsAndFindsDormantTenants() {
+    const relay = fakeRelay();
+    const t = await makeTenant(relay);
+    const { core, storage } = relay.objects.get(t.tenant);
+    for (const age of [40, 31, 29, 1]) {
+      await mcp(relay, t, 'tools/call', { name: 'run_command', arguments: { command: `echo ${age}`, wait: 0 } });
+      storage.db.prepare(`UPDATE commands SET created_at = datetime('now', ?) WHERE id = (SELECT max(id) FROM commands)`).run(`-${age} days`);
+    }
+    storage.db.prepare(`INSERT INTO signins (id, code, state, created_at) VALUES ('x', 'ABC', 's', datetime('now', '-2 days'))`).run();
+    const now = Date.now();
+    // A tenant from before contact was recorded starts its clock at the first alarm.
+    assert.equal(core.info().last_seen, null);
+    const r = core.retain(now, 30, 90);
+    assert.deepEqual(r, { deleted: 2, dormant: false });
+    // Pending or not: the relay keeps nothing past 30 days.
+    assert.deepEqual(storage.db.prepare(`SELECT command FROM commands ORDER BY id`).all().map((x) => x.command), ['echo 29', 'echo 1']);
+    assert.equal(storage.db.prepare(`SELECT count(*) AS n FROM signins`).get().n, 0);
+    assert.ok(core.info().last_seen);
+    assert.equal(core.retain(now + 89 * DAY_MS, 30, 90).dormant, false);
+    assert.equal(core.retain(now + 91 * DAY_MS, 30, 90).dormant, true);
+    // The runner's contact resets it (written at most hourly).
+    await runner(relay, t, { op: 'claim', fg: 1 });
+    const seen = Date.parse(core.info().last_seen);
+    await runner(relay, t, { op: 'claim', fg: 1 });
+    assert.equal(Date.parse(core.info().last_seen), seen);
+    core.noteRunner(now + 91 * DAY_MS);
+    assert.equal(core.retain(now + 92 * DAY_MS, 30, 90).dormant, false);
+  },
+
+  async anAccountListsAndRemovesOnlyItsOwnMachines() {
+    const relay = fakeRelay();
+    const mine = await makeTenant(relay, DAVID, 'desk');
+    const theirs = await makeTenant(relay, 'https://cms.sasonica.com|2', 'other');
+    const as = (tok, init = {}) => ({ ...init, headers: { ...(init.headers ?? {}), authorization: `Bearer ${tok}` } });
+    assert.equal((await relay.go('/account/machines')).status, 401);
+    assert.equal((await relay.go('/account/machines', as('nonsense'))).status, 401);
+    const listed = await (await relay.go('/account/machines', as('tok-1'))).json();
+    assert.equal(listed.account, DAVID);
+    assert.deepEqual(listed.machines.map((m) => [m.tenant, m.machine]), [[mine.tenant, 'desk']]);
+    assert.ok(!JSON.stringify(listed).includes(mine.SASONICA_RUNNER_TOKEN));
+    // Not one's own: as if it did not exist.
+    assert.equal((await relay.go(`/account/machines/${theirs.tenant}`, as('tok-1', { method: 'DELETE' }))).status, 404);
+    assert.equal((await mcp(relay, theirs, 'ping')).status, 200);
+    assert.equal((await relay.go(`/account/machines/${mine.tenant}`, as('tok-1', { method: 'DELETE' }))).status, 200);
+    assert.equal((await mcp(relay, mine, 'ping')).status, 404);
+    assert.deepEqual((await (await relay.go('/account/machines', as('tok-1'))).json()).machines, []);
+  },
+
+  async theAccountPageSignsInListsAndRemoves() {
+    const relay = fakeRelay();
+    const t = await makeTenant(relay, DAVID, 'desk');
+    const start = await relay.go('/account');
+    assert.equal(start.status, 302);
+    const to = new URL(start.headers.get('location'));
+    assert.equal(to.searchParams.get('redirect_uri'), 'https://relay.example/join/callback');
+    const state = to.searchParams.get('state');
+    assert.match(state, /^acct\.[0-9a-f]{32}$/);
+    const pkce = /sas_pkce=([^;]+)/.exec(start.headers.get('set-cookie'))[1];
+    // Back without the cookie (another browser): nothing.
+    assert.equal((await relay.go(`/join/callback?code=good-code&state=${state}`)).status, 400);
+    const back = await relay.go(`/join/callback?code=good-code&state=${state}`, { headers: { cookie: `sas_pkce=${pkce}` } });
+    assert.equal(back.status, 303);
+    assert.equal(back.headers.get('location'), '/account');
+    const cookies = back.headers.getSetCookie();
+    const acct = cookies.find((c) => c.startsWith('sas_acct='));
+    assert.match(acct, /HttpOnly; Secure; SameSite=Strict/);
+    const jar = { cookie: acct.split(';')[0] };
+    const pageHtml = await (await relay.go('/account', { headers: jar })).text();
+    assert.ok(pageHtml.includes('desk') && pageHtml.includes(t.tenant) && pageHtml.includes('david'));
+    // A form posted from elsewhere is refused.
+    const form = { 'content-type': 'application/x-www-form-urlencoded' };
+    assert.equal((await relay.go('/account/remove', { method: 'POST', headers: { ...jar, ...form }, body: `tenant=${t.tenant}` })).status, 403);
+    const removed = await relay.go('/account/remove', {
+      method: 'POST', headers: { ...jar, ...form, origin: 'https://relay.example' }, body: `tenant=${t.tenant}` });
+    assert.ok((await removed.text()).includes('Removed desk.'));
+    assert.equal((await mcp(relay, t, 'ping')).status, 404);
+    // Signing in is rate limited per IP.
+    relay.env.JOIN_LIMIT = relay.limiter(0);
+    assert.equal((await relay.go('/account')).status, 429);
+  },
+
+  async deletingAnAccountRemovesItsTenants() {
+    const relay = fakeRelay();
+    relay.env.RELAY_MACHINES_PER_ACCOUNT = '3';
+    const a1 = await makeTenant(relay, 'https://cms.sasonica.com|7', 'one');
+    const a2 = await makeTenant(relay, 'https://cms.sasonica.com|7', 'two');
+    const other = await makeTenant(relay, DAVID, 'desk');
+    const hook = (tok, account) => relay.go('/hooks/account-deleted', {
+      method: 'POST', headers: { authorization: `Bearer ${tok}` }, body: JSON.stringify({ account }) });
+    assert.equal((await hook('nope', 'https://cms.sasonica.com|7')).status, 404);
+    // The hook token reaches nothing else.
+    assert.equal((await relay.go(`/admin/tenants/${a1.tenant}`, { headers: { authorization: `Bearer ${HOOK}` } })).status, 404);
+    const r = await (await hook(HOOK, 'https://cms.sasonica.com|7')).json();
+    assert.deepEqual(r.removed.sort(), [a1.tenant, a2.tenant].sort());
+    assert.equal((await mcp(relay, a1, 'ping')).status, 404);
+    assert.equal((await mcp(relay, a2, 'ping')).status, 404);
+    assert.equal((await mcp(relay, other, 'ping')).status, 200);
+    // Again: nothing left, and no error.
+    assert.deepEqual((await (await hook(HOOK, 'https://cms.sasonica.com|7')).json()).removed, []);
+  },
+
+  async adminCanInspectRemoveAndIndexATenant() {
+    const relay = fakeRelay();
+    const t = await makeTenant(relay, DAVID, 'desk');
+    const adm = (init = {}) => ({ ...init, headers: { authorization: `Bearer ${ADMIN}` } });
+    assert.equal((await relay.go(`/admin/tenants/${t.tenant}`)).status, 404);
+    const info = await (await relay.go(`/admin/tenants/${t.tenant}`, adm())).json();
+    assert.deepEqual([info.account, info.machine], [DAVID, 'desk']);
+    assert.ok(!JSON.stringify(info).includes(t.hmac_key));
+    // A tenant from before the list: off it, then indexed back on.
+    await relay.accounts.get(DAVID).remove(t.tenant);
+    assert.equal((await relay.go(`/admin/tenants/${t.tenant}/index`, adm({ method: 'POST' }))).status, 200);
+    const listed = await (await relay.go(`/admin/accounts/${encodeURIComponent(DAVID)}`, adm())).json();
+    assert.deepEqual(listed.machines.map((m) => m.tenant), [t.tenant]);
+    assert.equal((await relay.go(`/admin/tenants/${t.tenant}`, adm({ method: 'DELETE' }))).status, 200);
+    assert.equal((await relay.go(`/admin/tenants/${t.tenant}`, adm())).status, 404);
+    assert.deepEqual(await relay.accounts.get(DAVID).list(), []);
+  },
+});
 
 const only = process.argv[2];
 let failed = 0;

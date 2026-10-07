@@ -4,6 +4,7 @@
 //
 //     npx wrangler deploy -c wrangler.relay.jsonc
 //     npx wrangler secret put RELAY_ADMIN_TOKEN -c wrangler.relay.jsonc
+//     npx wrangler secret put RELAY_ACCOUNT_HOOK_TOKEN -c wrangler.relay.jsonc   (cms.sasonica.com's, app.env SASONICA_RELAY_HOOK_TOKEN)
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sasonica-relay",
@@ -18,15 +19,37 @@
   "observability": { "enabled": true, "logs": { "invocation_logs": false } },
   "durable_objects": { "bindings": [
     { "name": "TENANTS", "class_name": "Tenant" },
-    { "name": "JOINS", "class_name": "Join" }
+    { "name": "JOINS", "class_name": "Join" },
+    { "name": "ACCOUNTS", "class_name": "Account" }
   ] },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Tenant"] },
-    { "tag": "v2", "new_sqlite_classes": ["Join"] }
+    { "tag": "v2", "new_sqlite_classes": ["Join"] },
+    { "tag": "v3", "new_sqlite_classes": ["Account"] }
+  ],
+  // Rate limits (src/tenant.ts relayFetch), Cloudflare's rate-limit binding:
+  // per location and approximate, which is what a beta wants. `period` is
+  // 10 or 60 seconds. The keys: JOIN_LIMIT the client IP (/join/start, the
+  // account page's sign-in); MCP_LIMIT a tenant's connector URL; RUNNER_LIMIT
+  // a tenant's runner token. A busy runner makes a claim every 5 s and a
+  // heartbeat per running job every 3 s, so 300 a minute leaves it room.
+  "ratelimits": [
+    { "name": "JOIN_LIMIT", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } },
+    { "name": "MCP_LIMIT", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } },
+    { "name": "RUNNER_LIMIT", "namespace_id": "1003", "simple": { "limit": 300, "period": 60 } }
   ],
   // Who may join with a Sasonica account (src/tenant.ts accountAllowed):
   // `<issuer>|<sub>`, comma-separated, or `*`. David's account, for now.
-  "vars": { "RELAY_ALLOW_ACCOUNTS": "https://cms.sasonica.com|1" },
+  // The beta's limits and retention (docs/hosted-relay.md): machines one
+  // account may have joined at once (a further join replaces the oldest,
+  // saying so first); days a command row is kept on the relay; days without
+  // runner contact before a tenant is removed.
+  "vars": {
+    "RELAY_ALLOW_ACCOUNTS": "https://cms.sasonica.com|1",
+    "RELAY_MACHINES_PER_ACCOUNT": "1",
+    "RELAY_KEEP_DAYS": "30",
+    "RELAY_DORMANT_DAYS": "90"
+  },
   // schema.sql is imported as text: the same schema a machine's D1 gets.
   "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }]
 }
