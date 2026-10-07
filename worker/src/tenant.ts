@@ -105,6 +105,33 @@ export interface TenantInfo {
 export const DAY_MS = 86_400_000
 const SEEN_WRITE_MS = 3_600_000
 
+/**
+ * Rate limits, counted exactly in a Durable Object's memory: a one-minute
+ * window of counts per key. Memory only -- an object evicted while idle
+ * forgets its counts, which only ever errs towards letting a request
+ * through, and a burst keeps the object (and the counts) alive. Used in
+ * place of Cloudflare's rate-limit binding, which let every request
+ * through on relay.sasonica.com (8 Oct 2026).
+ */
+export class RateWindow {
+  private start = 0
+  private counts = new Map<string, number>()
+  /** Whether this hit is within `limit`. */
+  hit(key: string, limit: number, now: number = Date.now()): boolean {
+    if (now - this.start >= 60_000) { this.start = now; this.counts.clear() }
+    const n = (this.counts.get(key) ?? 0) + 1
+    if (this.counts.has(key) || this.counts.size < 10_000) this.counts.set(key, n)
+    return n <= limit
+  }
+}
+
+export const RATE_TEXT = 'Rate limited by the Sasonica relay: try again in a minute.'
+export const tooMany = (body: unknown = { error: RATE_TEXT }) =>
+  Response.json(body, { status: 429, headers: { 'retry-after': '60' } })
+
+/** Per-minute limits a tenant keeps (RELAY_MCP_PER_MIN, RELAY_RUNNER_PER_MIN). */
+export interface TenantLimits { mcp: number; runner: number }
+
 export class TenantCore {
   readonly db: D1Database
   private meta: Meta | null = null
@@ -112,13 +139,17 @@ export class TenantCore {
   private schema: string
   /** Rings the runner's doorbell: every authenticated socket hears 'ring'. */
   private ring: () => void
+  private limits: () => TenantLimits
+  private window = new RateWindow()
 
   // Plain fields, not parameter properties: tests load this file with
   // Node's type stripping, which does not do those.
-  constructor(storage: StorageLike, schema: string, ring: () => void = () => {}) {
+  constructor(storage: StorageLike, schema: string, ring: () => void = () => {},
+              limits: () => TenantLimits = () => ({ mcp: 120, runner: 300 })) {
     this.storage = storage
     this.schema = schema
     this.ring = ring
+    this.limits = limits
     this.db = d1Over(storage.sql, (fn) => storage.transactionSync(fn))
   }
 
@@ -215,11 +246,29 @@ export class TenantCore {
     return timingSafeEqual(await sha256Hex(offered), m.runner_token_sha256)
   }
 
+  /**
+   * Over this tenant's limit? Keyed by the credential the request carries
+   * (hashed): a stranger guessing at the URL spends their own allowance, not
+   * the owner's. Never by IP -- an assistant's MCP calls come from its
+   * vendor's servers, shared by all its users.
+   */
+  async limited(request: Request): Promise<Response | null> {
+    const path = new URL(request.url).pathname
+    const runner = path === '/runner' || path === '/runner/ws'
+    const cred = runner ? (request.headers.get('authorization') ?? 'ws') : path.split('/').filter(Boolean)[0] ?? ''
+    const key = `${runner ? 'r' : 'm'}:${(await sha256Hex(cred)).slice(0, 16)}`
+    const lim = this.limits()
+    if (this.window.hit(key, runner ? lim.runner : lim.mcp)) return null
+    return runner ? tooMany() : tooMany({ jsonrpc: '2.0', id: null, error: { code: -32000, message: RATE_TEXT } })
+  }
+
   /** The runner API and MCP, as a self-hosted Worker serves them. The path
    *  is the tenant-relative one (/runner, /<secret>/mcp). */
   async fetch(request: Request): Promise<Response> {
     const m = this.load()
     if (!m) return new Response('not found', { status: 404 })
+    const over = await this.limited(request)
+    if (over) return over
     const env: Env = {
       DB: this.db,
       SASONICA_HMAC_KEY: m.hmac_key,
@@ -267,9 +316,9 @@ export interface JoinStub {
   deliver(creds: Creds): Promise<void>
   collect(poll: string): Promise<{ status: string } | { creds: Creds } | null>
 }
-/** Cloudflare's rate-limit binding (wrangler.relay.jsonc `ratelimits`). */
-export interface RateLimit {
-  limit(o: { key: string }): Promise<{ success: boolean }>
+export interface LimiterStub {
+  /** Whether this hit is within `limit` a minute. */
+  hit(key: string, limit: number): Promise<boolean>
 }
 interface Namespace<T> { idFromName(name: string): unknown; get(id: any): T }
 export interface RelayEnv {
@@ -294,12 +343,13 @@ export interface RelayEnv {
   RELAY_KEEP_DAYS?: string
   /** Days without any runner contact before a tenant is removed (default 90). */
   RELAY_DORMANT_DAYS?: string
-  /** Per client IP: /join/start and the account page's sign-in. */
-  JOIN_LIMIT?: RateLimit
-  /** Per tenant connector URL: MCP calls. */
-  MCP_LIMIT?: RateLimit
-  /** Per tenant runner token: the runner API and its doorbell. */
-  RUNNER_LIMIT?: RateLimit
+  /** One object per client IP, counting its joins and sign-ins. */
+  LIMITS: Namespace<LimiterStub>
+  /** Per minute: joins started (and account sign-ins) per IP (default 5);
+   *  MCP calls per connector URL (120); runner requests per token (300). */
+  RELAY_JOIN_PER_MIN?: string
+  RELAY_MCP_PER_MIN?: string
+  RELAY_RUNNER_PER_MIN?: string
   /** Tests only: stands in for fetch() to cms.sasonica.com. */
   ISSUER_FETCH?: typeof fetch
 }
@@ -313,6 +363,9 @@ export function relaySettings(env: Partial<RelayEnv>) {
     machines: whole(env.RELAY_MACHINES_PER_ACCOUNT, 1),
     keepDays: whole(env.RELAY_KEEP_DAYS, 30),
     dormantDays: whole(env.RELAY_DORMANT_DAYS, 90),
+    joinPerMin: whole(env.RELAY_JOIN_PER_MIN, 5),
+    mcpPerMin: whole(env.RELAY_MCP_PER_MIN, 120),
+    runnerPerMin: whole(env.RELAY_RUNNER_PER_MIN, 300),
   }
 }
 
@@ -335,31 +388,25 @@ const tenantStub = (env: RelayEnv, t: string) => env.TENANTS.get(env.TENANTS.idF
 const accountStub = (env: RelayEnv, a: string) => env.ACCOUNTS.get(env.ACCOUNTS.idFromName(a))
 const clientIp = (r: Request) => r.headers.get('cf-connecting-ip') ?? 'unknown'
 const bearer = (r: Request) => (r.headers.get('authorization') ?? '').replace(/^Bearer /, '')
-const keyOf = async (t: string) => (await sha256Hex(t)).slice(0, 16)
 
-/**
- * Over the limit? A missing binding, or one that fails, lets the request
- * through: a limiter outage must not take the relay down with it.
- */
-async function overLimit(binding: RateLimit | undefined, key: string): Promise<boolean> {
-  if (!binding) return false
-  try { return !(await binding.limit({ key })).success } catch { return false }
+/** Over the per-IP limit for starting a join or an account sign-in? */
+async function ipOverLimit(env: RelayEnv, request: Request, kind: string): Promise<boolean> {
+  const ip = clientIp(request)
+  try {
+    return !(await env.LIMITS.get(env.LIMITS.idFromName(ip)).hit(kind, relaySettings(env).joinPerMin))
+  } catch (e) {
+    // A limiter fault must not close the relay.
+    console.warn(`rate limiter failed open: ${(e as Error)?.message ?? e}`)
+    return false
+  }
 }
-const RATE_TEXT = 'Rate limited by the Sasonica relay: try again in a minute.'
-const tooMany = (body: unknown = { error: RATE_TEXT }) =>
-  Response.json(body, { status: 429, headers: { 'retry-after': '60' } })
 
 /**
  * Everything at /t/<tenant>/... goes to that tenant's object with the prefix
  * taken off, so a machine's SASONICA_WORKER_URL is https://<relay>/t/<tenant>
  * and the runner and the connector URL need no change at all: /runner,
  * /runner/ws and /<secret>/mcp underneath it, as on a Worker of their own.
- *
- * Rate limits are taken here, before the object is woken, keyed by the
- * credential a request carries (hashed) under its tenant: so a stranger
- * guessing at a tenant's URL spends their own allowance, not its owner's.
- * Not by IP for MCP -- an assistant's calls come from its vendor's servers,
- * shared by every user of that assistant.
+ * Rate limits are the tenant object's own (TenantCore.limited).
  */
 export async function relayFetch(request: Request, env: RelayEnv): Promise<Response> {
   const url = new URL(request.url)
@@ -371,11 +418,6 @@ export async function relayFetch(request: Request, env: RelayEnv): Promise<Respo
   if (parts.length === 2 && parts[0] === 'hooks' && parts[1] === 'account-deleted') return accountDeleted(request, env)
   if (parts[0] !== 't' || !TENANT_RE.test(parts[1] ?? '')) return notFound()
   const rest = parts.slice(2)
-  if (rest[0] === 'runner') {
-    if (await overLimit(env.RUNNER_LIMIT, `${parts[1]}:${await keyOf(bearer(request) || 'ws')}`)) return tooMany()
-  } else if (await overLimit(env.MCP_LIMIT, `${parts[1]}:${await keyOf(rest[0] ?? '')}`)) {
-    return tooMany({ jsonrpc: '2.0', id: null, error: { code: -32000, message: RATE_TEXT } })
-  }
   const inner = new URL(`/${rest.join('/')}${url.search}`, url.origin)
   return tenantStub(env, parts[1]).fetch(new Request(inner, request))
 }
@@ -532,7 +574,7 @@ async function accountFetch(request: Request, env: RelayEnv, url: URL, parts: st
   const who = await accountForToken(tokenOf(request), fetcher)
   if (parts.length === 1 && request.method === 'GET') {
     if (!who) {
-      if (await overLimit(env.JOIN_LIMIT, `acct:${clientIp(request)}`)) return tooMany()
+      if (await ipOverLimit(env, request, 'account')) return tooMany()
       return accountSignIn(url.origin)
     }
     return accountPage(who.who, await machinesOf(env, who.account))
@@ -578,7 +620,7 @@ const escText = (t: string) => t.replace(/[&<>]/g, '')
 async function joinFetch(request: Request, env: RelayEnv, url: URL, parts: string[]): Promise<Response> {
   const stubFor = (id: string) => env.JOINS.get(env.JOINS.idFromName(id))
   if (parts.length === 2 && parts[1] === 'start' && request.method === 'POST') {
-    if (await overLimit(env.JOIN_LIMIT, `join:${clientIp(request)}`)) return tooMany()
+    if (await ipOverLimit(env, request, 'join')) return tooMany()
     let body: any
     try { body = await request.json() } catch { body = {} }
     const id = randomHex(16)

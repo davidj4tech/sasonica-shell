@@ -20,35 +20,33 @@
   "durable_objects": { "bindings": [
     { "name": "TENANTS", "class_name": "Tenant" },
     { "name": "JOINS", "class_name": "Join" },
-    { "name": "ACCOUNTS", "class_name": "Account" }
+    { "name": "ACCOUNTS", "class_name": "Account" },
+    { "name": "LIMITS", "class_name": "Limiter" }
   ] },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Tenant"] },
     { "tag": "v2", "new_sqlite_classes": ["Join"] },
-    { "tag": "v3", "new_sqlite_classes": ["Account"] }
-  ],
-  // Rate limits (src/tenant.ts relayFetch), Cloudflare's rate-limit binding:
-  // per location and approximate, which is what a beta wants. `period` is
-  // 10 or 60 seconds. The keys: JOIN_LIMIT the client IP (/join/start, the
-  // account page's sign-in); MCP_LIMIT a tenant's connector URL; RUNNER_LIMIT
-  // a tenant's runner token. A busy runner makes a claim every 5 s and a
-  // heartbeat per running job every 3 s, so 300 a minute leaves it room.
-  "ratelimits": [
-    { "name": "JOIN_LIMIT", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } },
-    { "name": "MCP_LIMIT", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } },
-    { "name": "RUNNER_LIMIT", "namespace_id": "1003", "simple": { "limit": 300, "period": 60 } }
+    { "tag": "v3", "new_sqlite_classes": ["Account"] },
+    { "tag": "v4", "new_sqlite_classes": ["Limiter"] }
   ],
   // Who may join with a Sasonica account (src/tenant.ts accountAllowed):
   // `<issuer>|<sub>`, comma-separated, or `*`. David's account, for now.
   // The beta's limits and retention (docs/hosted-relay.md): machines one
   // account may have joined at once (a further join replaces the oldest,
   // saying so first); days a command row is kept on the relay; days without
-  // runner contact before a tenant is removed.
+  // runner contact before a tenant is removed. Rate limits, per minute,
+  // counted in Durable Objects (src/tenant.ts RateWindow): joins and account
+  // sign-ins started per client IP; MCP calls per connector URL; runner
+  // requests per runner token (a busy runner claims every 5 s and sends a
+  // heartbeat per running job every 3 s, so 300 leaves it room).
   "vars": {
     "RELAY_ALLOW_ACCOUNTS": "https://cms.sasonica.com|1",
     "RELAY_MACHINES_PER_ACCOUNT": "1",
     "RELAY_KEEP_DAYS": "30",
-    "RELAY_DORMANT_DAYS": "90"
+    "RELAY_DORMANT_DAYS": "90",
+    "RELAY_JOIN_PER_MIN": "5",
+    "RELAY_MCP_PER_MIN": "120",
+    "RELAY_RUNNER_PER_MIN": "300"
   },
   // schema.sql is imported as text: the same schema a machine's D1 gets.
   "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }]

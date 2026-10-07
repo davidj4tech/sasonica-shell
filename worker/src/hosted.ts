@@ -6,7 +6,7 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import SCHEMA from '../../schema.sql'
-import { accountAllowed, DAY_MS, relayFetch, relaySettings, TenantCore, type RelayEnv, type TenantInit } from './tenant.ts'
+import { accountAllowed, DAY_MS, RateWindow, relayFetch, relaySettings, TenantCore, type RelayEnv, type TenantInit } from './tenant.ts'
 import { JOIN_TTL_MS, JoinCore, type Creds } from './join.ts'
 import { AccountCore, type MachineEntry } from './account.ts'
 
@@ -20,7 +20,10 @@ export class Tenant extends DurableObject<RelayEnv> {
 
   constructor(ctx: DurableObjectState, env: RelayEnv) {
     super(ctx, env)
-    this.core = new TenantCore(ctx.storage, SCHEMA, () => this.ring())
+    this.core = new TenantCore(ctx.storage, SCHEMA, () => this.ring(), () => {
+      const s = relaySettings(this.env)
+      return { mcp: s.mcpPerMin, runner: s.runnerPerMin }
+    })
     // The runner's keepalive is answered without waking the object, so an
     // idle machine costs nothing while it hibernates.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'))
@@ -87,6 +90,8 @@ export class Tenant extends DurableObject<RelayEnv> {
       if (!this.core.load() || request.headers.get('upgrade')?.toLowerCase() !== 'websocket') {
         return new Response('not found', { status: 404 })
       }
+      const over = await this.core.limited(request)
+      if (over) return over
       const pending = this.ctx.getWebSockets().filter((ws) => !ws.deserializeAttachment()?.ok)
       for (const ws of pending.slice(0, Math.max(0, pending.length - MAX_PENDING_SOCKETS + 1))) {
         try { ws.close(1008, 'too many') } catch { /* already gone */ }
@@ -149,6 +154,12 @@ export class Join extends DurableObject<RelayEnv> {
     this.core.wipe()
     await this.ctx.storage.deleteAll()
   }
+}
+
+/** One client IP's joins and sign-ins started, per minute (in memory). */
+export class Limiter extends DurableObject<RelayEnv> {
+  private window = new RateWindow()
+  hit(key: string, limit: number) { return this.window.hit(key, limit) }
 }
 
 /** One Sasonica account's list of tenants (./account.ts). */

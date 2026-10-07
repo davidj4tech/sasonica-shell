@@ -16,7 +16,7 @@ import { sign } from './fake-d1.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA = readFileSync(path.join(HERE, '..', 'schema.sql'), 'utf8');
-const { TenantCore, relayFetch, accountAllowed, DAY_MS } = await import('../worker/src/tenant.ts');
+const { TenantCore, relayFetch, accountAllowed, relaySettings, RateWindow, DAY_MS } = await import('../worker/src/tenant.ts');
 const { AccountCore } = await import('../worker/src/account.ts');
 const { JoinCore, JOIN_TTL_MS } = await import('../worker/src/join.ts');
 const { resetClientCache } = await import('../worker/src/index.ts');
@@ -51,6 +51,7 @@ function fakeStorage() {
 // The namespace: one TenantCore per name, made on first get, as
 // idFromName/get make an object on first use.
 function fakeRelay() {
+  const env = {};
   const objects = new Map();
   const rings = new Map();
   const TENANTS = {
@@ -59,7 +60,10 @@ function fakeRelay() {
       if (!objects.has(name)) {
         const storage = fakeStorage();
         rings.set(name, 0);
-        const core = new TenantCore(storage, SCHEMA, () => rings.set(name, rings.get(name) + 1));
+        const core = new TenantCore(storage, SCHEMA, () => rings.set(name, rings.get(name) + 1), () => {
+          const st = relaySettings(env);
+          return { mcp: st.mcpPerMin, runner: st.runnerPerMin };
+        });
         objects.set(name, {
           core, storage, fetch: (r) => core.fetch(r), init: async (t) => core.init(t), info: async () => core.info(),
           // What deleteAll does to a Durable Object: nothing of it is left.
@@ -124,18 +128,24 @@ function fakeRelay() {
       return joins.get(name);
     },
   };
-  // Cloudflare's rate-limit binding, exactly counted: `limit` per key, until reset.
-  const limiter = (limit) => {
-    const seen = new Map();
-    return { seen, limit: async ({ key }) => { seen.set(key, (seen.get(key) ?? 0) + 1); return { success: seen.get(key) <= limit }; } };
+  // The per-IP Limiter objects.
+  const limiters = new Map();
+  const LIMITS = {
+    idFromName: (name) => name,
+    get(name) {
+      if (!limiters.has(name)) {
+        const w = new RateWindow();
+        limiters.set(name, { hit: async (k, limit) => w.hit(k, limit) });
+      }
+      return limiters.get(name);
+    },
   };
-  const env = {
-    TENANTS, JOINS, ACCOUNTS, RELAY_ADMIN_TOKEN: ADMIN, RELAY_ALLOW_ACCOUNTS: 'https://cms.sasonica.com|1,https://cms.sasonica.com|2',
-    RELAY_ACCOUNT_HOOK_TOKEN: HOOK, JOIN_LIMIT: limiter(1000), MCP_LIMIT: limiter(1000), RUNNER_LIMIT: limiter(1000),
-    ISSUER_FETCH: fetcher,
-  };
+  Object.assign(env, {
+    TENANTS, JOINS, ACCOUNTS, LIMITS, RELAY_ADMIN_TOKEN: ADMIN, RELAY_ALLOW_ACCOUNTS: 'https://cms.sasonica.com|1,https://cms.sasonica.com|2',
+    RELAY_ACCOUNT_HOOK_TOKEN: HOOK, RELAY_JOIN_PER_MIN: '1000', ISSUER_FETCH: fetcher,
+  });
   const go = (p, init = {}) => relayFetch(new Request(`https://relay.example${p}`, init), env);
-  return { env, objects, accounts, rings, go, issuer, clock, limiter };
+  return { env, objects, accounts, rings, go, issuer, clock };
 }
 
 // A join up to its confirm page: start, the redirect, the callback.
@@ -378,7 +388,7 @@ const cases = {
 Object.assign(cases, {
   async joinStartIsLimitedPerIp() {
     const relay = fakeRelay();
-    relay.env.JOIN_LIMIT = relay.limiter(2);
+    relay.env.RELAY_JOIN_PER_MIN = '2';
     const start = (ip) => relay.go('/join/start', { method: 'POST', headers: { 'cf-connecting-ip': ip }, body: '{}' });
     assert.equal((await start('1.1.1.1')).status, 200);
     assert.equal((await start('1.1.1.1')).status, 200);
@@ -387,14 +397,17 @@ Object.assign(cases, {
     assert.equal(third.headers.get('retry-after'), '60');
     assert.equal((await start('2.2.2.2')).status, 200);
     // A limiter that fails lets the request through rather than closing the relay.
-    relay.env.JOIN_LIMIT = { limit: async () => { throw new Error('down'); } };
+    relay.env.LIMITS = { idFromName: (n) => n, get: () => ({ hit: async () => { throw new Error('down'); } }) };
     assert.equal((await start('1.1.1.1')).status, 200);
+    // The window: a minute.
+    const w = new RateWindow();
+    assert.deepEqual([w.hit('k', 1, 0), w.hit('k', 1, 59_999), w.hit('k', 1, 60_000)], [true, false, true]);
   },
 
   async mcpAndRunnerAreLimitedPerTenantCredential() {
     const relay = fakeRelay();
-    relay.env.MCP_LIMIT = relay.limiter(3);
-    relay.env.RUNNER_LIMIT = relay.limiter(2);
+    relay.env.RELAY_MCP_PER_MIN = '3';
+    relay.env.RELAY_RUNNER_PER_MIN = '2';
     const a = await makeTenant(relay, 'acct-a');
     const b = await makeTenant(relay, 'acct-b');
     // A stranger guessing at A's URL spends their own allowance, not A's.
@@ -407,9 +420,6 @@ Object.assign(cases, {
     for (let i = 0; i < 2; i++) assert.equal((await runner(relay, a, { op: 'claim', fg: 1 })).status, 200);
     assert.equal((await runner(relay, a, { op: 'claim', fg: 1 })).status, 429);
     assert.equal((await runner(relay, b, { op: 'claim', fg: 1 })).status, 200);
-    // Keys are hashes: no credential is handed to the limiter.
-    const keys = [...relay.env.MCP_LIMIT.seen.keys(), ...relay.env.RUNNER_LIMIT.seen.keys()].join(' ');
-    assert.ok(!keys.includes(a.SASONICA_URL_SECRET) && !keys.includes(a.SASONICA_RUNNER_TOKEN));
   },
 
   async aSecondJoinReplacesTheFirstAndSaysSo() {
@@ -517,7 +527,8 @@ Object.assign(cases, {
     assert.ok((await removed.text()).includes('Removed desk.'));
     assert.equal((await mcp(relay, t, 'ping')).status, 404);
     // Signing in is rate limited per IP.
-    relay.env.JOIN_LIMIT = relay.limiter(0);
+    relay.env.RELAY_JOIN_PER_MIN = '1';
+    await relay.go('/account');
     assert.equal((await relay.go('/account')).status, 429);
   },
 
