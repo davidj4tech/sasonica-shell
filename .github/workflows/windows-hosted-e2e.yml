@@ -45,6 +45,8 @@ jobs:
           $p = Start-Process powershell.exe -PassThru -NoNewWindow `
             -RedirectStandardOutput $out -RedirectStandardError $err `
             -ArgumentList '-NoProfile', '-Command', 'irm https://sasonica.com/install.ps1 | iex'
+          # Without holding the handle, ExitCode reads empty once it has exited.
+          $null = $p.Handle
           $redact = { param($s) $s -replace '(/t/[A-Za-z0-9_-]+/)[A-Za-z0-9_-]+(/mcp)', '$1<secret>$2' }
           $shown = 0
           $posted = $false
@@ -68,12 +70,19 @@ jobs:
             Start-Sleep -Seconds 2
           }
           if (Test-Path $err) { Get-Content $err | ForEach-Object { Write-Host (& $redact $_) } }
+          $p.WaitForExit()
           if ($p.ExitCode -ne 0) { throw "the installer stopped (exit $($p.ExitCode))" }
           $url = (Get-Content $out | Select-String -Pattern 'https://\S+/t/\S+/mcp' | Select-Object -Last 1).Matches[0].Value
           if (-not $url) { throw 'no connector URL in the installer output' }
           $env:CONNECTOR = $url
           $enc = node -e "const c=require('crypto');const k=Buffer.from(process.env.PUBKEY,'base64').toString();process.stdout.write(c.publicEncrypt({key:k,padding:c.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},Buffer.from(process.env.CONNECTOR)).toString('base64'))"
           Write-Host "CONNECTOR-ENC: $enc"
+          # Also as a check run: the log can't be read until the job ends.
+          $body = @{ name = 'connector'; head_sha = $env:GITHUB_SHA; status = 'in_progress';
+                     output = @{ title = 'Connector URL (encrypted)'; summary = $enc } } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/check-runs" `
+            -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' } `
+            -Body $body -ContentType 'application/json' | Out-Null
 
       - name: The runner, as the Scheduled Task left it
         shell: powershell
