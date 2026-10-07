@@ -211,6 +211,11 @@ has a case for each. What stays David's call: `RELAY_ALLOW_ACCOUNTS=*`.
   that can do nothing else). A failed call is retried on cron for 90 days. The
   delete page says relay machines go. Tested live: a throwaway account's
   tenant was gone the moment the account was deleted.
+- **Found on the way:** cms.sasonica.com refused every account but the admin
+  (`access_denied`), because the authenticated role lacked simple_oauth's
+  `grant simple_oauth codes`. Granted (websites `29ddbf0`); `/account` then
+  signed in as `sasonica-test2` live and listed its (no) machines. The same
+  fix applies to the app's sign-in for anyone but David.
 - **Admin** (`RELAY_ADMIN_TOKEN`): `GET`/`DELETE /admin/tenants/<id>`,
   `POST /admin/tenants/<id>/index` (lists a tenant made before the account
   list under its account), `GET /admin/accounts/<account, URL-encoded>`.
