@@ -300,7 +300,7 @@ long-command `wait: 0` / `get_result` / `cancel` steps, and the
 ### What remains before `RELAY_ALLOW_ACCOUNTS=*` (David's call)
 
 - ~~Publishing Google sign-in~~: published 8 Oct 2026.
-- The terms of service: a draft is in websites
-  `sites/sasonica/content/terms-of-service.md`, for David to review and publish.
+- ~~The terms of service~~: published at sasonica.com/terms-of-service
+  8 Oct 2026 (websites `sites/sasonica/content/terms-of-service.md`).
 - The privacy policy's "not yet open to everyone" line, changed on opening;
   sasonica.com/start and /download's "coming soon" for Windows.
