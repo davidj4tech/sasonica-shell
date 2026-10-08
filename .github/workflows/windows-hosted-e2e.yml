@@ -20,6 +20,11 @@ on:
       minutes:
         description: Minutes to stay up after joining, for commands through the relay
         default: '15'
+      entry:
+        description: "How to start it: the PowerShell one-liner, or the download page's Sasonica-Setup.cmd"
+        type: choice
+        options: [oneliner, cmd]
+        default: oneliner
 permissions:
   contents: read
   # The join link goes out as a check run: step logs can't be read until a
@@ -36,15 +41,28 @@ jobs:
           PUBKEY: ${{ inputs.pubkey }}
           MINUTES: ${{ inputs.minutes }}
           GH_TOKEN: ${{ github.token }}
+          ENTRY: ${{ inputs.entry }}
         run: |
           $ErrorActionPreference = 'Stop'
           $out = Join-Path $env:RUNNER_TEMP 'install.out'
           $err = Join-Path $env:RUNNER_TEMP 'install.err'
           # A process of its own, as a person's PowerShell window would be,
           # with its output to files this step reads (and redacts) as it goes.
-          $p = Start-Process powershell.exe -PassThru -NoNewWindow `
-            -RedirectStandardOutput $out -RedirectStandardError $err `
-            -ArgumentList '-NoProfile', '-Command', 'irm https://sasonica.com/install.ps1 | iex'
+          if ($env:ENTRY -eq 'cmd') {
+            # As a person would: download sasonica.com/get/Sasonica-Setup.cmd,
+            # marked as from the internet, and run it (stdin empty, so its
+            # closing `pause` returns).
+            $cmd = Join-Path $env:RUNNER_TEMP 'Sasonica-Setup.cmd'
+            Invoke-WebRequest https://sasonica.com/get/Sasonica-Setup.cmd -OutFile $cmd
+            Set-Content -Path $cmd -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+            $nul = Join-Path $env:RUNNER_TEMP 'empty.txt'; Set-Content $nul ''
+            $p = Start-Process cmd.exe -PassThru -NoNewWindow -RedirectStandardInput $nul `
+              -RedirectStandardOutput $out -RedirectStandardError $err -ArgumentList '/c', "`"$cmd`""
+          } else {
+            $p = Start-Process powershell.exe -PassThru -NoNewWindow `
+              -RedirectStandardOutput $out -RedirectStandardError $err `
+              -ArgumentList '-NoProfile', '-Command', 'irm https://sasonica.com/install.ps1 | iex'
+          }
           # Without holding the handle, ExitCode reads empty once it has exited.
           $null = $p.Handle
           $redact = { param($s) $s -replace '(/t/[A-Za-z0-9_-]+/)[A-Za-z0-9_-]+(/mcp)', '$1<secret>$2' }
