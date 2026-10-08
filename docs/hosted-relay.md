@@ -299,7 +299,7 @@ long-command `wait: 0` / `get_result` / `cancel` steps, and the
 
 ### What remains before `RELAY_ALLOW_ACCOUNTS=*` (David's call)
 
-- Publishing Google sign-in in Google's OAuth console (out of testing mode).
+- ~~Publishing Google sign-in~~: published 8 Oct 2026.
 - The terms of service: a draft is in websites
   `sites/sasonica/content/terms-of-service.md`, for David to review and publish.
 - The privacy policy's "not yet open to everyone" line, changed on opening;
