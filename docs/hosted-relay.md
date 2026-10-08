@@ -297,7 +297,12 @@ Not covered by this run: a person adding the connector to claude.ai, the
 long-command `wait: 0` / `get_result` / `cancel` steps, and the
 `/account` Remove button (each tested on Linux).
 
-### What remains before `RELAY_ALLOW_ACCOUNTS=*` (David's call)
+### Opened 8 Oct 2026
+
+`RELAY_ALLOW_ACCOUNTS=*` deployed on David's go-ahead (6af1773): any
+Sasonica account can join one machine. What was on the list before it:
+
+#### Before opening (all done)
 
 - ~~Publishing Google sign-in~~: published 8 Oct 2026.
 - ~~The terms of service~~: published at sasonica.com/terms
