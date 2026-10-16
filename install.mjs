@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { cfRequest } from './lib/cloudflare.mjs';
 import { DEFAULT_RELAY, joinRelay, openBrowser } from './lib/hosted-join.mjs';
-import { hex, siteName, urlSecret, readEnvFile, renderEnv, renderShim, shimNames, connectorUrl,
+import { hex, siteName, urlSecret, readEnvFile, renderEnv, renderShim, commandPlan, isOwnShim, RECORD, renderRecord, connectorUrl,
          winShellCommand, needsWindowsShell, OAUTH_KV_MARKER, oauthKvLine, ownerPolicyBody,
          accessAppBody } from './lib/install-lib.mjs';
 
@@ -457,28 +457,41 @@ writeText(ENV_FILE, renderEnv({
 }), 0o600);
 mkdirSync(path.join(CONF, 'skills'), { recursive: true });
 
-// `sasonica` as a command, or `sasonica-shell` where the server is `sasonica`
-// (shimNames). rm first: an earlier installer left a SYMLINK here, and
-// writing through one rewrites the file it points at instead of replacing it.
+// `sasonica` as a command where this is alone; beside Sasonica's server no
+// command at all, the server running this as `sasonica shell` (commandPlan).
+// Either way the runner is recorded for the server to find. rm first: an
+// earlier installer left a SYMLINK here, and writing through one rewrites
+// the file it points at instead of replacing it.
 const binDir = WIN ? path.join(CONF, 'bin') : path.join(homedir(), '.local', 'bin');
 const shimAt = (name) => path.join(binDir, WIN ? `${name}.cmd` : name);
 function textAt(file) {
   try { return lstatSync(file).isSymbolicLink() ? null : readFileSync(file).subarray(0, 400).toString('latin1'); }
   catch { return null; }
 }
-const cmdNames = shimNames({
-  win: WIN, existing: WIN ? null : textAt(shimAt('sasonica')), shimPath: shimAt('sasonica'),
-  firstOnPath: WIN ? (run('where', ['sasonica'], { capture: true }).out || '').split(/\r?\n/)[0] : '',
+writeText(path.join(CONF, RECORD), renderRecord({ node: NODE, runner: RUNNER }));
+const plan = commandPlan({
+  win: WIN,
+  existing: WIN ? null : textAt(shimAt('sasonica')),
+  serverExe: WIN && existsSync(path.join(homedir(), '.local', 'bin', 'sasonica.exe')),
+  onPath: WIN ? (run('where', ['sasonica'], { capture: true }).out || '').split(/\r?\n/) : [],
+  shimPaths: ['sasonica', 'sasonica-shell'].map(shimAt),
 });
-const CMD = cmdNames[cmdNames.length - 1];
-for (const name of cmdNames) {
+for (const name of plan.remove) {
+  // Only this installer's own shims: never the server's binary.
+  const text = textAt(shimAt(name));
+  if (text !== null && isOwnShim(text)) rmSync(shimAt(name), { force: true });
+}
+for (const name of plan.write) {
   const shim = shimAt(name);
   rmSync(shim, { force: true });
   writeText(shim, renderShim({ node: NODE, runner: RUNNER, win: WIN }));
   if (!WIN) chmodSync(shim, 0o755);
 }
-if (CMD !== 'sasonica') note(`the command is ${CMD} here: sasonica is Sasonica's server`);
-if (WIN) {
+// What to type: Shell's own words are `sasonica <word>` either way (the
+// server forwards them); the rest is `sasonica shell …` beside the server.
+const SH = plan.server ? 'sasonica shell' : 'sasonica';
+if (plan.server) note("no command of Shell's own here: sasonica is Sasonica's server, and Shell is `sasonica shell`");
+if (WIN && plan.write.length) {
   const userPath = process.env.Path ?? '';
   if (!userPath.split(';').includes(binDir)) {
     run('powershell.exe', ['-NoProfile', '-Command',
@@ -563,7 +576,7 @@ ${signin === 'app' ? `
     signs in, stop the secret URL: sasonica client revoke default
     Signed-in assistants: sasonica client grants
 ` : ''}
-    Status:      ${CMD} status        (${CMD} --help for the rest)
+    Status:      sasonica status        (${SH} --help for the rest)
     Skills:      link SKILL.md files into ${path.join(CONF, 'skills')} for assistants to find
     Config:      ${ENV_FILE}   (runner token, URL secret)   ${KEY_FILE}
-    Re-run the installer any time (${CMD} install); it keeps existing keys and ids.`);
+    Re-run the installer any time (${SH} install); it keeps existing keys and ids.`);

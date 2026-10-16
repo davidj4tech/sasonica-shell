@@ -684,6 +684,9 @@ const cases = {
   async refusesPlaintextWorkerUrl() {
     setup();
     process.env.SASONICA_WORKER_URL = 'http://shell.example.com';
+    // No word: the service's runner. This case's own name, left in argv, is
+    // a word the runner refuses before it reads any config.
+    process.argv = [process.argv[0], RUNNER];
     await assert.rejects(() => import(pathToFileURL(RUNNER).href), /must be https/);
   },
 
@@ -930,6 +933,31 @@ const cliCases = {
     assert.equal(refused.status, 2);
     assert.match(String(refused.stderr), /only the shell exists/);
     rmSync(tmp, { recursive: true, force: true });
+  },
+
+  // A word the runner does not know is an error, not the polling loop in the
+  // foreground (the service passes no words); beside the server, which runs
+  // this as `sasonica shell`, the help and the error say so (David, 16 Oct 2026).
+  unknownWordIsRefused() {
+    const empty = mkdtempSync(path.join(tmpdir(), 'sasonica-word-'));
+    const env = { ...process.env, SASONICA_CONF: empty };
+    delete env.SASONICA_SHELL_VIA_SERVER;
+    const r = spawnSync(process.execPath, [RUNNER, 'statsu'], { env, encoding: 'utf8', timeout: 10_000 });
+    assert.equal(r.status, 2, r.stderr);
+    assert.match(r.stderr, /^sasonica: no command 'statsu'/);
+    const via = spawnSync(process.execPath, [RUNNER, 'poll'],
+      { env: { ...env, SASONICA_SHELL_VIA_SERVER: '1' }, encoding: 'utf8', timeout: 10_000 });
+    assert.equal(via.status, 2);
+    assert.match(via.stderr, /^sasonica shell: no command 'poll' \(sasonica shell --help/);
+    const help = execFileSync(process.execPath, [RUNNER, '--help'],
+      { env: { ...env, SASONICA_SHELL_VIA_SERVER: '1' }, encoding: 'utf8' });
+    assert.match(help, /sasonica shell --once/);
+    assert.match(help, /sasonica shell install \[--no-service/);
+    assert.match(help, /sasonica status \[n\]/);
+    const alone = execFileSync(process.execPath, [RUNNER, '--help'], { env, encoding: 'utf8' });
+    assert.match(alone, /sasonica install \[shell\]/);
+    assert.doesNotMatch(alone, /sasonica shell/);
+    rmSync(empty, { recursive: true, force: true });
   },
 
   // `sasonica pair` (and `devices`) is agent-media's `media-visual-canvas pair` under the

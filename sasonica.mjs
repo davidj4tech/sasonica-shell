@@ -370,8 +370,24 @@ function planToolRow(command) {
 
 const [sub, ...rest] = process.argv.slice(2);
 
+// Beside Sasonica's server there is one `sasonica`, the server's, and this is
+// `sasonica shell …` (David, 16 Oct 2026): the server says so in the
+// environment, and the help and messages name what to type. Shell's other
+// words (status, skills, url…) are `sasonica <word>` either way: the server
+// forwards them here.
+const SH = process.env.SASONICA_SHELL_VIA_SERVER ? 'sasonica shell' : 'sasonica';
+
+// No word is the polling loop (what the service runs); a word this does not
+// know is a mistake, not a request to start polling in the foreground.
+const WORDS = new Set(['--help', '-h', 'help', 'sign', 'install', 'pair', 'devices', 'skills',
+  'tools', 'client', 'url', 'status', '--once']);
+if (sub !== undefined && !WORDS.has(sub)) {
+  console.error(`${SH}: no command '${sub}' (${SH} --help lists them)`);
+  process.exit(2);
+}
+
 if (sub === '--help' || sub === '-h' || sub === 'help') {
-  console.log(`sasonica: Sasonica Shell runs signed shell commands queued by an assistant, on this machine.
+  console.log(`${SH}: Sasonica Shell runs signed shell commands queued by an assistant, on this machine.
 
   sasonica skills        the tools the owner has set up here, and where to read about each
   sasonica tools         the typed tools this machine publishes, and the argv each runs
@@ -384,10 +400,10 @@ if (sub === '--help' || sub === '-h' || sub === 'help') {
                          (.../<secret>/<n>/mcp) so rows say which connector queued
                          them. Every form of it is a PASSWORD: whoever has it can
                          run commands here. Paste it only into a connector.
-  sasonica --once        one poll, then exit
-  sasonica               poll forever (what the service runs)
+  ${SH.padEnd(22)} poll forever (what the service runs)
+  ${(SH + ' --once').padEnd(22)} one poll, then exit
   sasonica sign <nonce> <command>   the signature this runner expects
-  sasonica install [shell] [--no-service|--print-url]
+  ${SH} install${SH === 'sasonica' ? ' [shell]' : ''} [--no-service|--print-url]
                          set up or repair this machine (install.mjs)
   sasonica pair [--device <name>]
                          a one-time pairing link + QR: a browser by default, the
@@ -432,8 +448,8 @@ if (sub === 'sign') {
 if (sub === 'install') {
   const args = rest[0] === 'shell' ? rest.slice(1) : rest;
   if (args[0] && !args[0].startsWith('-')) {
-    console.error(`sasonica install: '${args[0]}' is not something this can install yet; `
-      + 'only the shell exists (sasonica install [shell])');
+    console.error(`${SH} install: '${args[0]}' is not something this can install yet; `
+      + `only the shell exists (${SH} install${SH === 'sasonica' ? ' [shell]' : ''})`);
     process.exit(2);
   }
   const installer = path.join(path.dirname(SELF), 'install.mjs');

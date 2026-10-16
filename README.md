@@ -127,12 +127,14 @@ The short version for an existing Cloudflare user:
 
    On macOS, install [Homebrew](https://brew.sh) first; the same `./install.sh` sets up dependencies and a login LaunchAgent.
 
-   On Windows, run `.\install.ps1` from PowerShell. It is a native installer: no WSL2, no Ubuntu. The runner there is the same `sasonica.mjs` under Node, started by a Scheduled Task at logon. With no clone at all, `irm https://sasonica.com/install.ps1 | iex` downloads this repository (`get.ps1`) and joins the hosted relay with a Sasonica account — no Cloudflare account needed (`install.ps1 -Hosted`, or `--hosted` to `install.sh`/`install.mjs`, does the same from a clone).
+   On Windows, run `.\install.ps1` from PowerShell. It is a native installer: no WSL2, no Ubuntu. The runner there is the same `sasonica.mjs` under Node, started by a Scheduled Task at logon. With no clone at all, `irm https://sasonica.com/shell.ps1 | iex` downloads this repository (`get.ps1`) and joins the hosted relay with a Sasonica account — no Cloudflare account needed (`install.ps1 -Hosted`, or `--hosted` to `install.sh`/`install.mjs`, does the same from a clone).
 3. Add the printed `https://.../<secret>/mcp` URL to your MCP client as a remote/custom connector with no additional authentication.
 
 The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows). The runner is the same `sasonica.mjs` on all three.
 
 Re-running the installer is safe. Existing IDs and secrets are reused unless you deliberately rotate them. Once a machine has the `sasonica` command, `sasonica install` re-runs it from anywhere, with the same flags (`--no-service`, `--print-url`); `sasonica install shell` is the same thing, named the way the [umbrella](docs/umbrella.md#installer-shape) names its pieces.
+
+**Beside Sasonica's server** (agent-media's `sasonica` binary) there is one `sasonica` command, the server's. The installer then writes no command of Shell's own (and removes the `sasonica-shell` one an earlier version wrote); it records where the runner is, in `~/.config/sasonica/runner` (`%APPDATA%\sasonica\runner`: the node, then `sasonica.mjs`), and the server runs Shell from there: `sasonica shell …` with any arguments (`sasonica shell --help`, `sasonica shell install`, `sasonica shell --once`), and Shell's own words — `sasonica status`, `skills`, `tools`, `url`, `client`, `sign` — go to Shell by themselves. `sasonica pair`, `devices`, `install` and `help` are the server's. The service runs node and the runner directly, so it is the same either way. A Shell installed before the server is taken in the same way when the server installs.
 
 Several machines can share one Cloudflare account. Each gets its own Worker and D1 database named `sasonica-shell-<site>`; the site name defaults to the hostname. Copy `install.conf.example` to `install.conf` if you want to pre-answer the installer prompts.
 

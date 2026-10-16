@@ -11,7 +11,7 @@ import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { siteName, urlSecret, readEnvFile, renderEnv, renderShim, shimNames, OAUTH_KV_MARKER, oauthKvLine, ownerPolicyBody, accessAppBody,
+import { siteName, urlSecret, readEnvFile, renderEnv, renderShim, commandPlan, renderRecord, OAUTH_KV_MARKER, oauthKvLine, ownerPolicyBody, accessAppBody,
          winShellCommand, needsWindowsShell } from '../lib/install-lib.mjs';
 import { plist } from '../lib/service-macos.mjs';
 import { taskCommand } from '../lib/service-windows.mjs';
@@ -92,18 +92,30 @@ const cases = {
     assert.match(win, /"C:\\n\\node\.exe" "C:\\r\\sasonica\.mjs" %\*/);
   },
 
-  // The server (agent-media) is ~/.local/bin/sasonica too: never written over.
-  shimNeverReplacesTheServer() {
+  // One command (David, 16 Oct 2026): beside the server (agent-media, whose
+  // binary is ~/.local/bin/sasonica too) Shell writes no command, never over
+  // the server's, and removes the second name an earlier installer took.
+  commandPlanLeavesSasonicaToTheServer() {
     const ours = renderShim({ node: '/n/node', runner: '/r/sasonica.mjs', win: false });
-    assert.deepEqual(shimNames({ win: false, existing: null }), ['sasonica']);
-    assert.deepEqual(shimNames({ win: false, existing: ours }), ['sasonica']);
-    assert.deepEqual(shimNames({ win: false, existing: '\x7fELF\x02\x01\x01' }), ['sasonica-shell']);
-    assert.deepEqual(shimNames({ win: false, existing: '#!/bin/sh\n# sasonica shim\nexec x' }), ['sasonica-shell']);
-    const shimPath = 'C:\\Users\\a\\AppData\\Roaming\\sasonica\\bin\\sasonica.cmd';
-    assert.deepEqual(shimNames({ win: true, shimPath }), ['sasonica']);
-    assert.deepEqual(shimNames({ win: true, shimPath, firstOnPath: shimPath.toUpperCase() }), ['sasonica']);
-    assert.deepEqual(shimNames({ win: true, shimPath, firstOnPath: 'C:\\Users\\a\\.local\\bin\\sasonica.exe' }),
-      ['sasonica', 'sasonica-shell']);
+    const alone = { server: false, write: ['sasonica'], remove: ['sasonica-shell'] };
+    assert.deepEqual(commandPlan({ win: false, existing: null }), alone);
+    assert.deepEqual(commandPlan({ win: false, existing: ours }), alone);
+    const beside = { server: true, write: [], remove: ['sasonica-shell'] };
+    assert.deepEqual(commandPlan({ win: false, existing: '\x7fELF\x02\x01\x01' }), beside);
+    assert.deepEqual(commandPlan({ win: false, existing: '#!/bin/sh\n# sasonica shim\nexec x' }), beside);
+    const shimPaths = ['C:\\Users\\a\\AppData\\Roaming\\sasonica\\bin\\sasonica.cmd',
+      'C:\\Users\\a\\AppData\\Roaming\\sasonica\\bin\\sasonica-shell.cmd'];
+    assert.deepEqual(commandPlan({ win: true, shimPaths }), alone);
+    assert.deepEqual(commandPlan({ win: true, shimPaths, onPath: [shimPaths[0].toUpperCase(), shimPaths[1], ''] }), alone);
+    const winBeside = { server: true, write: [], remove: ['sasonica', 'sasonica-shell'] };
+    assert.deepEqual(commandPlan({ win: true, shimPaths, serverExe: true }), winBeside);
+    assert.deepEqual(commandPlan({ win: true, shimPaths,
+      onPath: [shimPaths[0], 'C:\\Users\\a\\.local\\bin\\sasonica.exe'] }), winBeside);
+  },
+
+  // The record the server's `sasonica shell` reads: node, then the runner.
+  recordIsNodeThenRunner() {
+    assert.equal(renderRecord({ node: '/n/node', runner: '/r/sasonica.mjs' }), '/n/node\n/r/sasonica.mjs\n');
   },
 
   // A plist is XML and these paths can hold & and spaces. install.sh used
