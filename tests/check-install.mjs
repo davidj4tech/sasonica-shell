@@ -11,7 +11,7 @@ import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'no
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { siteName, urlSecret, readEnvFile, renderEnv, renderShim, OAUTH_KV_MARKER, oauthKvLine, ownerPolicyBody, accessAppBody,
+import { siteName, urlSecret, readEnvFile, renderEnv, renderShim, shimNames, OAUTH_KV_MARKER, oauthKvLine, ownerPolicyBody, accessAppBody,
          winShellCommand, needsWindowsShell } from '../lib/install-lib.mjs';
 import { plist } from '../lib/service-macos.mjs';
 import { taskCommand } from '../lib/service-windows.mjs';
@@ -90,6 +90,20 @@ const cases = {
     assert.match(posix, /exec "\/n\/node" "\/r\/sasonica\.mjs" "\$@"/);
     const win = renderShim({ node: 'C:\\n\\node.exe', runner: 'C:\\r\\sasonica.mjs', win: true });
     assert.match(win, /"C:\\n\\node\.exe" "C:\\r\\sasonica\.mjs" %\*/);
+  },
+
+  // The server (agent-media) is ~/.local/bin/sasonica too: never written over.
+  shimNeverReplacesTheServer() {
+    const ours = renderShim({ node: '/n/node', runner: '/r/sasonica.mjs', win: false });
+    assert.deepEqual(shimNames({ win: false, existing: null }), ['sasonica']);
+    assert.deepEqual(shimNames({ win: false, existing: ours }), ['sasonica']);
+    assert.deepEqual(shimNames({ win: false, existing: '\x7fELF\x02\x01\x01' }), ['sasonica-shell']);
+    assert.deepEqual(shimNames({ win: false, existing: '#!/bin/sh\n# sasonica shim\nexec x' }), ['sasonica-shell']);
+    const shimPath = 'C:\\Users\\a\\AppData\\Roaming\\sasonica\\bin\\sasonica.cmd';
+    assert.deepEqual(shimNames({ win: true, shimPath }), ['sasonica']);
+    assert.deepEqual(shimNames({ win: true, shimPath, firstOnPath: shimPath.toUpperCase() }), ['sasonica']);
+    assert.deepEqual(shimNames({ win: true, shimPath, firstOnPath: 'C:\\Users\\a\\.local\\bin\\sasonica.exe' }),
+      ['sasonica', 'sasonica-shell']);
   },
 
   // A plist is XML and these paths can hold & and spaces. install.sh used
