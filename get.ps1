@@ -1,9 +1,9 @@
 <#
   get.ps1 — Sasonica Shell on Windows in one line, from nothing:
 
-      irm https://sasonica.com/install.ps1 | iex
+      irm https://sasonica.com/shell.ps1 | iex
 
-  (sasonica.com/install.ps1 redirects here.) No git, no Cloudflare account:
+  (sasonica.com/shell.ps1 redirects here.) No git, no Cloudflare account:
   it downloads this repository as a zip into %LOCALAPPDATA%\sasonica\shell,
   then runs install.ps1 -Hosted, which gets Node if it is missing and joins
   the hosted relay — a link and a code to sign in with a Sasonica account.

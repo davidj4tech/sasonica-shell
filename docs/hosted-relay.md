@@ -247,7 +247,7 @@ CLOUDFLARE_API_TOKEN=$SPL_CLOUDFLARE_TOKEN npx wrangler deploy -c wrangler.relay
 
 Then on the Windows machine (Windows PowerShell 5.1, no Cloudflare account):
 
-1. `irm https://sasonica.com/install.ps1 | iex` — downloads the repo to
+1. `irm https://sasonica.com/shell.ps1 | iex` — downloads the repo to
    `%LOCALAPPDATA%\sasonica\shell`, gets Node if missing, runs
    `install.ps1 -Hosted`; it prints a link and a six-character code.
 2. Open the link, sign in as `sasonica-test2`, check the code matches, press
